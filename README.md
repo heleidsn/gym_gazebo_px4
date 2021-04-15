@@ -22,6 +22,13 @@ gym-basic/           # 主文件夹
 
 ### 初始化仓库
 
+```bash
+git init
+git add --all
+```
+
 ### 将本地仓库推送到远程
+
+使用github新建远程仓库
 
 ### 创建submodule
