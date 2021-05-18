@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-05-18 09:48:56
+LastEditTime: 2021-05-18 11:40:21
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -124,7 +124,7 @@ class PX4Env(gym.Env):
         self.action_num = 2         # 2 for 2d, 3 for 3d
         self.state_length = 4       # 2 for only position info, 4 for position and vel info
         self.control_method = 'vel' # acc or vel
-        self.takeoff_hight = 4
+        self.takeoff_hight = 5
         
         '''
         Settings for termination
