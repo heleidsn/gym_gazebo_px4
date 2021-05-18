@@ -9,5 +9,4 @@ register(
 register(
     id='gym-px4-v0',
     entry_point='gym_gazebo_px4.envs:PX4Env',
-    max_episode_steps = 400,
 )

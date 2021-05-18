@@ -1,10 +1,11 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-04-15 10:17:16
+LastEditTime: 2021-05-18 09:48:56
 Description: 
 Github: https://github.com/heleidsn
 '''
+from pickle import TRUE
 import gym
 from gym import error, spaces, utils
 from gym.utils import seeding
@@ -27,7 +28,7 @@ from geometry_msgs.msg import PoseStamped, TwistStamped, Quaternion, Vector3
 from sensor_msgs.msg import Image
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from nav_msgs.msg import Odometry
-from avoidance_rl_msg.msg import TrainInfo, AssistedInfo
+from td3fd.msg import TrainInfo, AssistedInfo
 
 from visualization_msgs.msg import Marker
 
@@ -44,14 +45,16 @@ class PX4Env(gym.Env):
         print('init px4 env...')
         # -----------------init ros node--------------------------------------
         rospy.init_node('mavdrone_test_env_helei', anonymous=False, log_level=rospy.INFO)
-        self.gazebo = GazeboConnection(start_init_physics_parameters=True, reset_world_or_sim="WORLD")
+        
+        self.gazebo = GazeboConnection(start_init_physics_parameters=False, reset_world_or_sim="WORLD")
         self.seed()
 
         self.px4_ekf2_path = os.path.join(rospkg.RosPack().get_path("px4"),"build/px4_sitl_default/bin/px4-ekf2")
         self.bridge = CvBridge()
 
         self._rate = rospy.Rate(5.0)
-        self.img_sample_num = 0
+
+        self.max_depth_meter_gazebo = 10
 
         # Subscribers 
         rospy.Subscriber('mavros/state', State, callback=self._stateCb, queue_size=10)
@@ -69,9 +72,7 @@ class PX4Env(gym.Env):
         self._action_pub = rospy.Publisher('/network/action', TwistStamped, queue_size=10)
         self._action_velocity_body_pub = rospy.Publisher('/mavros/setpoint_raw/local', PositionTarget, queue_size=10)
         self._reward_pub = rospy.Publisher('/network/reward', Float32, queue_size=10)
-        self._switch_pub = rospy.Publisher('/network/switch', Vector3, queue_size=10)
-        self._train_info_pub = rospy.Publisher('/envrionment/train_info', TrainInfo, queue_size=10)
-        self._assisted_info_pub = rospy.Publisher('/envrionment/assisted_info', AssistedInfo, queue_size=10)
+        self._train_info_pub = rospy.Publisher('/environment/train_info', TrainInfo, queue_size=10)
 
         # image
         self._depth_image_gray_input = rospy.Publisher('network/depth_image_input', Image, queue_size=10)
@@ -93,7 +94,6 @@ class PX4Env(gym.Env):
         self.gazebo.pauseSim()
 
         # state
-        self.max_episode_step = 800
         self.episode_num = 0
         self.step_num = 0
         self.total_step = 0
@@ -101,9 +101,6 @@ class PX4Env(gym.Env):
         self.last_obs = 0
         self.previous_distance_from_des_point = 0
         self.home_init = False
-
-        # state for assisted RL
-        self.assisted_info = AssistedInfo()
 
         # Variables for Subscribers callback
         self._current_state = State()
@@ -113,37 +110,54 @@ class PX4Env(gym.Env):
         self._pose_setpoint_avoidance = PoseStamped()
         self._local_odometry = Odometry()
 
-        # Variables for Publishers
-        self._local_vel_cmd = TwistStamped()
+        '''
+        Goal settings
+        '''
+        self.goal_angle_noise_degree = 180  # random goal direction
+        self.random_start_direction = True
+        self.goal_distance = 50
         self._goal_pose = PoseStamped()
 
-        # Some settings
-        self._output_switch = Vector3()
-        self.action_num = 2 # 2 for 2d, 3 for 3d
-        self.state_length = 4
+        '''
+        Settings for control method
+        '''
+        self.action_num = 2         # 2 for 2d, 3 for 3d
+        self.state_length = 4       # 2 for only position info, 4 for position and vel info
         self.control_method = 'vel' # acc or vel
         self.takeoff_hight = 4
         
+        '''
+        Settings for termination
+        '''
+        self.max_episode_step = 100
         self.accept_radius = 1
-        self.accept_velocity_norm = 0.2
-        self.goal_distance = 50
-        self.goal_angle_noise_degree = 180
+        self.accept_velocity_norm = 0.2 # For velocity control at goal position
+        
         self.work_space_x_max = self.goal_distance + 10
         self.work_space_x_min = -self.work_space_x_max
         self.work_space_y_max = self.work_space_x_max
         self.work_space_y_min = -self.work_space_x_max
         self.work_space_z_max = 15
         self.work_space_z_min = 1
+        self.max_vertical_difference = 5
 
+        self.min_dist_to_obs_meters = 3  # min distance to obstacle
+
+        '''
+        observation space
+        '''
         self.screen_height = 80
         self.screen_width = 100
-
+        
         self.observation_space = spaces.Box(low=0, high=255, shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
 
         self._state_raw = np.zeros(self.state_length)
         self._state_norm = np.zeros(self.state_length)
         self.all_state_raw = np.zeros(6) # store all the 6 states
 
+        '''
+        action space
+        '''
         # output forward vertital speed and yaw rate
         self.vel_xy_max = 1
         self.vel_xy_min = 0
@@ -152,10 +166,7 @@ class PX4Env(gym.Env):
 
         self.acc_xy_max = 1
         self.acc_z_max = 0.5
-        self.acc_yaw_max = math.radians(60)
-
-        self.max_depth_meter_gazebo = 10
-        self.max_vertical_difference = 5
+        self.acc_yaw_max = math.radians(60) 
 
         if self.action_num == 3:
             # 3d control
@@ -314,8 +325,17 @@ class PX4Env(gym.Env):
     def _reset_sim(self):
         """
         Including ***ekf2 stop*** and ***ekf2 start*** routines in original function
+        目前要解决的问题是：
+        1. 无人机在空中无法disarm，尝试从固件入手
+        2. 然后尝试先disarm，然后reset sim，最后reset ekf2.
+        问题解决：在固件中设置使用强制arm and disarm
+
+        遇到问题：
+        stop ekf2之后出现断开连接，无法重新连接。。。。
+        估计是需要旧版本固件。。。
         """
         rospy.logdebug("RESET SIM START --- DONT RESET CONTROLLERS")
+        
         # 1. disarm
         self.gazebo.unpauseSim()
         self._arming_client.call(False)
@@ -347,41 +367,23 @@ class PX4Env(gym.Env):
         # take off and change to offboard mode
         self.gazebo.unpauseSim()
         
-        if self.get_current_state().connected:
+        if self._current_state.connected:
 
-            self._arming_client.call(False)
-            rospy.logdebug("Disarmed...")
-
-            # self.setMavMode('MANUAL', 5)
             if not self.home_init:
                 # first time to init home position
                 self.SetHomePose()
 
             self.Arm()
+            
             self.TakeOff()
 
-            # change goal pose
-            # self._change_goal_pose(30, 0, self.takeoff_hight)
             self._change_goal_pose_random()
-            # rospy.logdebug("changed goal pose to 70 0 0")
-
-            # publish some init msgs to enable offboard mode
-            # for i in range(10):
-            #     vel_cmd_init = TwistStamped()
-            #     self.ExecuteAction(vel_cmd_init)
-
-
-            # for i in range(20):
-            #     self._set_action([0, 0, 0])
-
-            # set offboard mode
-            # self.setMavMode('OFFBOARD', 5)
-            # rospy.logdebug("Mode = OFFBOARD...")
-
-            self.gazebo.pauseSim()
-
+            goal_pose = self._goal_pose.pose.position
+            rospy.logdebug("changed goal pose to {} {} {}".format(goal_pose.x, goal_pose.y, goal_pose.z))
         else:
             rospy.logerr("NOT CONNECTED!!!!!!")
+
+            self.gazebo.pauseSim()
         
         # For Info Purposes
         self.step_num = 0
@@ -636,10 +638,6 @@ class PX4Env(gym.Env):
         current_orientation = current_pose.orientation
 
         is_inside_workspace_now = self.is_inside_workspace()
-        # too_close_to_grnd       = self.too_close_to_ground(current_position[2])
-        too_close_to_grnd       = False
-        # drone_flipped           = self.drone_has_flipped(current_orientation)
-        drone_flipped           = False
         has_reached_des_pose    = self.is_in_desired_pose()
         too_close_to_obstable   = self.too_close_to_obstacle()
 
@@ -659,8 +657,6 @@ class PX4Env(gym.Env):
 
         # We see if we are outside the Learning Space
         episode_done = not(is_inside_workspace_now) or\
-                        too_close_to_grnd or\
-                        drone_flipped or\
                         has_reached_des_pose or\
                         too_close_to_obstable or\
                         too_much_steps
@@ -693,115 +689,9 @@ class PX4Env(gym.Env):
 
         return reward
 
-    def _compute_reward_sparse(self, obs, done, action):
-        reward = 0
-        if done and self.is_in_desired_pose():
-            reward = 10
-
-        return reward
-
-    def _compute_reward_v2(self, obs, done):
-        '''
-        1. reduce the reward of extra controller
-        2. add time factor
-        '''
-        reward = 0
-        # get distance from goal position
-        distance_now = self.get_distance_from_desired_point(self._current_pose.pose.position)
-
-        if not done:
-            reward = self.previous_distance_from_des_point - distance_now
-            if reward > 0 and self._output_switch.x == 1:
-                reward = reward * 0.5
-
-            reward -= 0.05
-            self.previous_distance_from_des_point = distance_now
-        else:
-            if self.is_in_desired_pose():
-                reward = 10
-            
-            if self.too_close_to_obstacle():
-                reward = -10
-
-        # print(reward)
-        self._reward_pub.publish(reward)
-
-        return reward
-
-    def _change_goal_pose(self, x, y, z):
-        self._goal_pose = PoseStamped()
-        self._goal_pose.pose.position.x = x
-        self._goal_pose.pose.position.y = y
-        self._goal_pose.pose.position.z = z
-
-        self._goal_pose_pub.publish(self._goal_pose)
-
-    def _get_min_depth(self):
-        return self._depth_image_meter.min()
-
-    def get_current_state(self):
-        return self._current_state
-
-    def _get_state_feature2(self, current_pose, goal_pose, current_odom):
-        # get distance and angle in polar coordinate
-        # transfer to 0~255 image formate for cnn
-        relative_pose_x = goal_pose.pose.position.x - current_pose.pose.position.x
-        relative_pose_y = goal_pose.pose.position.y - current_pose.pose.position.y
-        relative_pose_z = goal_pose.pose.position.z - current_pose.pose.position.z
-        distance = math.sqrt(pow(relative_pose_x, 2) + pow(relative_pose_y, 2))
-        relative_yaw = self._get_relative_yaw(current_pose, goal_pose)
-
-        distance_norm = distance / self.goal_distance * 255
-        vertical_distance_norm = (relative_pose_z / self.max_vertical_difference / 2 + 0.5) * 255
-        
-        relative_yaw_norm = (relative_yaw / math.pi / 2 + 0.5 ) * 255
-
-        state_norm = np.array([distance_norm, vertical_distance_norm, relative_yaw_norm])
-
-        state_norm = np.clip(state_norm, 0, 255)
-        # print('distance: {:.2f}, relative_yaw: {:.2f}'.format(distance, relative_yaw))
-        return state_norm
-        
-    def _get_relative_yaw(self, current_pose, goal_pose):
-        # get relative angle
-        relative_pose_x = goal_pose.pose.position.x - current_pose.pose.position.x
-        relative_pose_y = goal_pose.pose.position.y - current_pose.pose.position.y
-        angle = math.atan2(relative_pose_y, relative_pose_x)
-
-        # get current yaw
-        explicit_quat = [current_pose.pose.orientation.x, current_pose.pose.orientation.y, \
-                                current_pose.pose.orientation.z, current_pose.pose.orientation.w]
-        
-        yaw_current = euler_from_quaternion(explicit_quat)[2]
-
-        # get yaw error
-        yaw_error = angle - yaw_current
-        if yaw_error > math.pi:
-            yaw_error -= 2*math.pi
-        elif yaw_error < -math.pi:
-            yaw_error += 2*math.pi
-
-        return yaw_error
-
 # Methods for PX4 control
     # --------------------------------------------
     def TakeOff(self):
-        # method 1: using auto.takeoff command, but it seems doesn't work any more...
-        # self.setMavMode('AUTO.TAKEOFF', 5)
-        # rospy.logdebug("Took off...")
-
-        # # # TODO: change 3 to take off parameter in px4
-        # while self._current_pose.pose.position.z < self.takeoff_hight - 0.1:
-        #     # 1. check arm status, if not, arm first
-        #     if not self._current_state.armed:
-        #         self._arming_client.call(True)
-        #         rospy.sleep(0.1)
-        #     # 2. check takeoff height
-        #     self.setMavMode('AUTO.TAKEOFF', 5)
-        #     state = "x: {:.2f} y: {:.2f} z: {:.2f}".format(self._current_pose.pose.position.x, self._current_pose.pose.position.y, \
-        #                                                     self._current_pose.pose.position.z)
-        #     # print(state)
-
         # method 2: using offboard mode to take off 
         pose_setpoint = PoseStamped()
         pose_setpoint.pose.position.x = 0
@@ -809,7 +699,10 @@ class PX4Env(gym.Env):
         pose_setpoint.pose.position.z = self.takeoff_hight
         
         # random yaw angle at start point
-        yaw_angle_rad = math.pi * (2 * random.random() - 1)
+        if self.random_start_direction:
+            yaw_angle_rad = math.pi * (2 * random.random() - 1)
+        else:
+            yaw_angle_rad = 0
         orientation_setpoint = quaternion_from_euler(0, 0, yaw_angle_rad)
         pose_setpoint.pose.orientation.x = orientation_setpoint[0]
         pose_setpoint.pose.orientation.y = orientation_setpoint[1]
@@ -818,21 +711,23 @@ class PX4Env(gym.Env):
         for i in range(10):
             self._local_pose_setpoint_pub.publish(pose_setpoint)
 
-        self.setMavMode('OFFBOARD', 5)
-        rospy.logdebug("Mode = OFFBOARD...")
+        # self.setMavMode('OFFBOARD', 5)
+        self._set_mode_client(0, 'OFFBOARD')
 
         while self._current_pose.pose.position.z < self.takeoff_hight - 0.2:
             # 1. publish topics
             self._local_pose_setpoint_pub.publish(pose_setpoint)
 
             # 2. check arm status, if not, arm first
+            rospy.logdebug('Armed: {}, Mode： {}'.format(self._current_state.armed, self._current_state.mode))
             if not self._current_state.armed:
-                print('ARM AGAIN')
+                rospy.logdebug('ARM AGAIN')
                 self._arming_client.call(True)
                 
             if self._current_state.mode != 'OFFBOARD':
-                print('SET OFFBOARD AGAIN')
-                self.setMavMode('OFFBOARD', 5)
+                rospy.logdebug('SET OFFBOARD AGAIN')
+                # self.setMavMode('OFFBOARD', 5)
+                self._set_mode_client(0, 'OFFBOARD')
             
             rospy.sleep(0.1)
 
@@ -847,6 +742,16 @@ class PX4Env(gym.Env):
             rospy.sleep(0.1)
 
         rospy.logdebug("ARMED!!!")
+
+    def Disarm(self):
+        rospy.logdebug("wait for disarmed")
+        rospy.wait_for_service("mavros/cmd/arming")
+
+        while self._current_state.armed:
+            self._arming_client.call(False)
+            rospy.sleep(0.1)
+
+        rospy.logdebug("DISARMED!!!")
 
     def SetHomePose(self):
         '''
@@ -873,7 +778,7 @@ class PX4Env(gym.Env):
         rospy.logdebug("setting FCU mode: {0}".format(mode))
         old_mode = self._current_state.mode
         loop_freq = 5  # Hz
-        rate = rospy.Rate(loop_freq)
+        rate_new = rospy.Rate(loop_freq)
         mode_set = False
         for i in range(timeout * loop_freq):
             if self._current_state.mode == mode:
@@ -888,13 +793,7 @@ class PX4Env(gym.Env):
                         rospy.logerr("failed to send mode command")
                 except rospy.ServiceException as e:
                     rospy.logerr(e)
-            rate.sleep()
-
-    def ExecuteAction(self, vel_msg):
-        rospy.logdebug("MavROS Base Twist Cmd>>" + str(vel_msg))
-        # self._check_local_vel_pub_connection()
-        self._local_vel_pub.publish(vel_msg)
-        self._rate.sleep()
+            rate_new.sleep()
 
 # Some useful methods
     # --------------------------------------------
@@ -930,8 +829,8 @@ class PX4Env(gym.Env):
         Check the distance to the obstacle using the depth perception
         """
         too_close = False
-        # TODO: add min distance to parameters
-        if self._get_min_depth() < 3:
+
+        if self._depth_image_meter.min() < self.min_dist_to_obs_meters:
             too_close = True
 
         return too_close
@@ -952,7 +851,7 @@ class PX4Env(gym.Env):
 
     def is_in_desired_pose(self):
         """
-        It return True if the current position is similar to the desired poistion
+        It return True if the current position is similar to the desired position
         """
         in_desired_pose = False
         current_pose = self._current_pose
@@ -976,12 +875,6 @@ class PX4Env(gym.Env):
         
         return angular_error
 
-    def set_output_switch(self, switch, q_network, q_extra):
-        self._output_switch.x = switch
-        self._output_switch.y = q_network
-        self._output_switch.z = q_extra
-        self._switch_pub.publish(self._output_switch)
-
     def get_current_yaw(self):
         orientation = self._current_pose.pose.orientation
 
@@ -992,6 +885,27 @@ class PX4Env(gym.Env):
         current_yaw = euler_from_quaternion(current_orientation)[2]
 
         return current_yaw
+    
+    def _get_relative_yaw(self, current_pose, goal_pose):
+        # get relative angle
+        relative_pose_x = goal_pose.pose.position.x - current_pose.pose.position.x
+        relative_pose_y = goal_pose.pose.position.y - current_pose.pose.position.y
+        angle = math.atan2(relative_pose_y, relative_pose_x)
+
+        # get current yaw
+        explicit_quat = [current_pose.pose.orientation.x, current_pose.pose.orientation.y, \
+                                current_pose.pose.orientation.z, current_pose.pose.orientation.w]
+        
+        yaw_current = euler_from_quaternion(explicit_quat)[2]
+
+        # get yaw error
+        yaw_error = angle - yaw_current
+        if yaw_error > math.pi:
+            yaw_error -= 2*math.pi
+        elif yaw_error < -math.pi:
+            yaw_error += 2*math.pi
+
+        return yaw_error
 
     def _change_goal_pose_random(self):
         distance = self.goal_distance
@@ -1037,14 +951,3 @@ class PX4Env(gym.Env):
         
         self._train_info_pub.publish(info)
 
-    def update_assisted_info(self, action_network, action_avoidance, q_value_network, q_value_avoidance, switch):
-
-        self.assisted_info.header.stamp = rospy.Time.now()
-
-        self.assisted_info.action_network = action_network
-        self.assisted_info.action_avoidance = action_avoidance
-        self.assisted_info.q_value_network = q_value_network
-        self.assisted_info.q_value_avoidance = q_value_avoidance
-        self.assisted_info.switch = switch
-
-        self._assisted_info_pub.publish(self.assisted_info)

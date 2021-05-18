@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:16:27
-LastEditTime: 2021-04-15 10:23:21
+LastEditTime: 2021-05-07 21:30:26
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -154,10 +154,3 @@ class GazeboConnection():
 
         self.update_gravity_call()
     
-    def delete_model(self, model_name):
-        """ Remove the model with 'modelName' from the Gazebo scene """
-        # delete_model : gazebo_msgs/DeleteModel
-        del_model_prox = rospy.ServiceProxy('gazebo/delete_model', DeleteModel) # Handle to model spawner
-        # rospy.wait_for_service('gazebo/delete_model') # Wait for the model loader to be ready 
-        # FREEZES EITHER WAY
-        del_model_prox(str(model_name)) # Remove from Gazebo
