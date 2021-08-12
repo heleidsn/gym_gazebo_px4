@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-05-18 19:06:06
+LastEditTime: 2021-06-12 22:11:51
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -36,6 +36,8 @@ from std_msgs.msg import Float32
 
 import subprocess32 as subprocess
 
+from stable_baselines.common.math_util import unscale_action, scale_action
+
 
 class PX4Env(gym.Env):
     metadata = {'render.modes': ['human']}
@@ -52,7 +54,7 @@ class PX4Env(gym.Env):
         self.px4_ekf2_path = os.path.join(rospkg.RosPack().get_path("px4"),"build/px4_sitl_default/bin/px4-ekf2")
         self.bridge = CvBridge()
 
-        self._rate = rospy.Rate(5.0)
+        self._rate = rospy.Rate(10.0)
 
         self.max_depth_meter_gazebo = 10
 
@@ -122,26 +124,26 @@ class PX4Env(gym.Env):
         Settings for control method
         '''
         self.action_num = 2         # 2 for 2d, 3 for 3d
-        self.state_length = 4       # 2 for only position info, 4 for position and vel info
+        self.state_length = 2       # 2 for only position info, 4 for position and vel info
         self.control_method = 'vel' # acc or vel
-        self.takeoff_hight = 5
+        self.takeoff_hight = 4
         
         '''
         Settings for termination
         '''
-        self.max_episode_step = 800
-        self.accept_radius = 1
+        self.max_episode_step = 500
+        self.accept_radius = 2
         self.accept_velocity_norm = 0.2 # For velocity control at goal position
         
         self.work_space_x_max = self.goal_distance + 10
         self.work_space_x_min = -self.work_space_x_max
         self.work_space_y_max = self.work_space_x_max
         self.work_space_y_min = -self.work_space_x_max
-        self.work_space_z_max = 15
+        self.work_space_z_max = 10
         self.work_space_z_min = 1
         self.max_vertical_difference = 5
 
-        self.min_dist_to_obs_meters = 3  # min distance to obstacle
+        self.min_dist_to_obs_meters = 1  # min distance to obstacle
 
         '''
         observation space
@@ -159,35 +161,46 @@ class PX4Env(gym.Env):
         action space
         '''
         # output forward vertital speed and yaw rate
-        self.vel_xy_max = 1
+        self.vel_xy_max = 3
         self.vel_xy_min = 0
         self.vel_z_max = 1
         self.vel_yaw_max = math.radians(30)
 
-        self.acc_xy_max = 1
-        self.acc_z_max = 0.5
-        self.acc_yaw_max = math.radians(60) 
+        # self.acc_xy_max = 1
+        # self.acc_z_max = 0.5
+        # self.acc_yaw_max = math.radians(60)
 
         if self.action_num == 3:
-            # 3d control
-            if self.control_method == 'vel':
-                self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_z_max, -self.vel_yaw_max]), \
-                                                high=np.array([self.vel_xy_max, self.vel_z_max, self.vel_yaw_max]), \
-                                                dtype=np.float32)
-            elif self.control_method == 'acc':
-                self.action_space = spaces.Box(low=np.array([-self.acc_xy_max, -self.acc_z_max, -self.acc_yaw_max]), \
-                                               high=np.array([self.acc_xy_max, self.acc_z_max, self.acc_yaw_max]), \
-                                                   dtype=np.float32)
+            self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_z_max, -self.vel_yaw_max]), \
+                                            high=np.array([self.vel_xy_max, self.vel_z_max, self.vel_yaw_max]), \
+                                            dtype=np.float32)
         elif self.action_num == 2:
-            # 2d control
-            if self.control_method == 'vel':
-                self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_yaw_max]), \
-                                                high=np.array([self.vel_xy_max, self.vel_yaw_max]), \
-                                                dtype=np.float32)
-            elif self.control_method == 'acc':
-                self.action_space = spaces.Box(low=np.array([-self.acc_xy_max, -self.acc_yaw_max]), \
-                                               high=np.array([self.acc_xy_max, self.acc_yaw_max]), \
-                                                   dtype=np.float32)
+            self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_yaw_max]), \
+                                            high=np.array([self.vel_xy_max, self.vel_yaw_max]), \
+                                            dtype=np.float32)
+        else:
+            print("error: action num must be 2 or 3")
+
+        # if self.action_num == 3:
+        #     # 3d control
+        #     if self.control_method == 'vel':
+        #         self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_z_max, -self.vel_yaw_max]), \
+        #                                         high=np.array([self.vel_xy_max, self.vel_z_max, self.vel_yaw_max]), \
+        #                                         dtype=np.float32)
+        #     elif self.control_method == 'acc':
+        #         self.action_space = spaces.Box(low=np.array([-self.acc_xy_max, -self.acc_z_max, -self.acc_yaw_max]), \
+        #                                        high=np.array([self.acc_xy_max, self.acc_z_max, self.acc_yaw_max]), \
+        #                                            dtype=np.float32)
+        # elif self.action_num == 2:
+        #     # 2d control
+        #     if self.control_method == 'vel':
+        #         self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_yaw_max]), \
+        #                                         high=np.array([self.vel_xy_max, self.vel_yaw_max]), \
+        #                                         dtype=np.float32)
+        #     elif self.control_method == 'acc':
+        #         self.action_space = spaces.Box(low=np.array([-self.acc_xy_max, -self.acc_yaw_max]), \
+        #                                        high=np.array([self.acc_xy_max, self.acc_yaw_max]), \
+        #                                            dtype=np.float32)
 
         rospy.logdebug('mavdrone_test_env_helei node initialized...')
 
@@ -260,12 +273,12 @@ class PX4Env(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def step(self, action):
+    def step(self, action, action_original):
         # rospy.loginfo('state_raw: ' + np.array2string(self.state_feature_raw, formatter={'float_kind':lambda x: "%.2f" % x}))
         # rospy.loginfo('state_norm: ' + np.array2string(self.state_feature_norm, formatter={'float_kind':lambda x: "%.2f" % x}))
         # rospy.loginfo('action real: ' + np.array2string(action, formatter={'float_kind':lambda x: "%.2f" % x}))
         self.gazebo.unpauseSim()
-        self._set_action(action)
+        self.set_action_pose(action)
         # rospy.loginfo('state_raw: ' + np.array2string(self.state_feature_raw, formatter={'float_kind':lambda x: "%.2f" % x}))
         # rospy.loginfo('state_norm: ' + np.array2string(self.state_feature_norm, formatter={'float_kind':lambda x: "%.2f" % x}))
         # rospy.loginfo('action real: ' + np.array2string(action, formatter={'float_kind':lambda x: "%.2f" % x}))
@@ -285,7 +298,7 @@ class PX4Env(gym.Env):
         self.step_num += 1
         self.total_step += 1
 
-        self.publish_train_info(self.last_obs, action, obs, done, reward, self.cumulated_episode_reward)
+        self.publish_train_info(self.last_obs, action, action_original, obs, done, reward, self.cumulated_episode_reward)
         self.last_obs = obs
     
         return obs, reward, done, info
@@ -308,6 +321,7 @@ class PX4Env(gym.Env):
         obs = self._get_obs()
         # obs = self._get_obs_mlp()
         self.last_obs = obs
+        self.gazebo.pauseSim()
         rospy.logdebug("reset function out")
         return obs
 
@@ -337,6 +351,7 @@ class PX4Env(gym.Env):
         rospy.logdebug("RESET SIM START --- DONT RESET CONTROLLERS")
         
         # 1. disarm
+        self.gazebo.pauseSim()
         self.gazebo.unpauseSim()
         self._arming_client.call(False)
         self.gazebo.pauseSim()
@@ -426,6 +441,7 @@ class PX4Env(gym.Env):
         Airsim pose use NED SYSTEM
         Gazebo pose z-axis up is positive different from NED
         Gazebo twist using body frame
+        Output： Normalized state feature (0~255) because the feature will input together with image
         '''
         goal_pose = self._goal_pose
         current_pose = self.pose_local
@@ -470,7 +486,7 @@ class PX4Env(gym.Env):
             state_norm = np.array([distance_norm, vertical_distance_norm, relative_yaw_norm, linear_velocity_norm, linear_velocity_z_norm, angular_velocity_norm])
 
         state_norm = np.clip(state_norm, 0, 255)
-        self.state_feature_norm = state_norm / 255
+        self.state_feature_norm = state_norm / 255  # (0~1)
 
         self.all_state_raw = np.array([distance, relative_pose_z, relative_yaw, linear_velocity_xy, linear_velocity_z, current_vel_local.angular.z])
 
@@ -549,6 +565,66 @@ class PX4Env(gym.Env):
 
         self._rate.sleep()
     
+    def set_action_pose(self, action):
+        '''
+        set action using desired pose
+        input: action_unscaled
+        '''
+        d_xy = action[0]
+        if self.action_num == 3:
+            d_z = action[1]
+        d_yaw = action[-1]
+        # transfer d_xy, d_z, d_yaw to pose data
+        current_yaw = self.get_current_yaw()
+        yaw_setpoint = current_yaw + d_yaw
+
+        dx_body = d_xy
+        dy_body = 0
+        dx_local, dy_local = self.point_transfer(dx_body, dy_body, -yaw_setpoint)
+
+        pose_setpoint = PoseStamped()
+        pose_setpoint.pose.position.x = self._current_pose.pose.position.x + dx_local
+        pose_setpoint.pose.position.y = self._current_pose.pose.position.y + dy_local
+        # pose_setpoint.pose.position.z = self._current_pose.pose.position.z + d_z
+        if self.action_num == 3:
+            pose_setpoint.pose.position.z = self._current_pose.pose.position.z + d_z
+        elif self.action_num == 2:
+            pose_setpoint.pose.position.z = self.takeoff_hight
+
+        orientation_setpoint = quaternion_from_euler(0, 0, yaw_setpoint)
+        pose_setpoint.pose.orientation.x = orientation_setpoint[0]
+        pose_setpoint.pose.orientation.y = orientation_setpoint[1]
+        pose_setpoint.pose.orientation.z = orientation_setpoint[2]
+        pose_setpoint.pose.orientation.w = orientation_setpoint[3]
+
+        marker_network_setpoint = Marker()
+        marker_network_setpoint.header.stamp = rospy.Time.now()
+        marker_network_setpoint.header.frame_id = 'local_origin'
+        marker_network_setpoint.type = Marker.SPHERE
+        marker_network_setpoint.action = Marker.ADD
+        marker_network_setpoint.pose.position = pose_setpoint.pose.position
+        marker_network_setpoint.pose.orientation.x = 0.0
+        marker_network_setpoint.pose.orientation.y = 0.0
+        marker_network_setpoint.pose.orientation.z = 0.0
+        marker_network_setpoint.pose.orientation.w = 1.0
+        marker_network_setpoint.scale.x = 0.3
+        marker_network_setpoint.scale.y = 0.3
+        marker_network_setpoint.scale.z = 0.3
+        marker_network_setpoint.color.a = 0.8
+        marker_network_setpoint.color.r = 0.0
+        marker_network_setpoint.color.g = 0.0
+        marker_network_setpoint.color.b = 0.0
+
+        # publish pose setpoint and it's marker
+        self._local_pose_setpoint_pub.publish(pose_setpoint)
+        self._setpoint_marker_pub.publish(marker_network_setpoint)
+
+        # publish goal pose marker
+        self.publish_marker_goal_pose(self._goal_pose)
+
+        self._rate.sleep()
+        # TODO: calculate sleep time for every step
+
     def publish_marker_goal_pose(self, goal_pose):
         # publish goal pose marker
         marker = Marker()
@@ -561,9 +637,9 @@ class PX4Env(gym.Env):
         marker.pose.orientation.y = 0.0
         marker.pose.orientation.z = 0.0
         marker.pose.orientation.w = 1.0
-        marker.scale.x = 1.0
-        marker.scale.y = 1.0
-        marker.scale.z = 1.0
+        marker.scale.x = self.accept_radius * 2
+        marker.scale.y = self.accept_radius * 2
+        marker.scale.z = self.accept_radius * 2
         marker.color.a = 0.8
         marker.color.r = 1.0
         marker.color.g = 0.0
@@ -571,7 +647,7 @@ class PX4Env(gym.Env):
 
         self._goal_pose_marker_pub.publish(marker)
 
-    def get_avoidance_output_state(self):
+    def get_avoidance_output_state_old(self):
         """
         transfer from avoidance msg: /mavros/setpoint_position/local_avoidance to
         scaled network output: forward speed and yaw rate in (-1, 1)
@@ -605,6 +681,55 @@ class PX4Env(gym.Env):
         avoidance_output = np.clip(avoidance_output, -1, 1)
 
         return avoidance_output
+
+    def get_avoidance_output_state(self):
+        '''
+        generate action from px4 avoidance output
+        avoidance output: /mavros/setpoint_position/local_avoidance
+        action_unscaled: d_xy, d_z, d_yaw
+        '''
+        self.gazebo.unpauseSim()
+        # wait for msgs
+        current_pose = rospy.wait_for_message('/mavros/setpoint_position/local_avoidance', PoseStamped)
+        desired_pose = rospy.wait_for_message('mavros/local_position/pose', PoseStamped)
+
+        dx_local = desired_pose.pose.position.x - current_pose.pose.position.x
+        dy_local = desired_pose.pose.position.y - current_pose.pose.position.y
+        d_xy = math.sqrt(dx_local*dx_local + dy_local*dy_local)
+        d_z = desired_pose.pose.position.z - current_pose.pose.position.z
+
+        explicit_quat1 = [desired_pose.pose.orientation.x, desired_pose.pose.orientation.y, desired_pose.pose.orientation.z, \
+                            desired_pose.pose.orientation.w]
+        explicit_quat2 = [current_pose.pose.orientation.x, current_pose.pose.orientation.y, \
+                            current_pose.pose.orientation.z, current_pose.pose.orientation.w]
+        yaw_setpoint = euler_from_quaternion(explicit_quat1)[2]
+        yaw_current = euler_from_quaternion(explicit_quat2)[2]
+
+        yaw_different = self.getAngularVelocity(yaw_setpoint, yaw_current)
+
+        print("yaw_sp: {:.2f} yaw: {:.2f} yaw_diff: {:.2f}".format(math.degrees(yaw_setpoint), math.degrees(yaw_current), math.degrees(yaw_different)))
+        
+        if d_xy < 0.1:
+            d_yaw = yaw_different
+        else:
+            # d_yaw = math.atan(dx_local/dy_local)
+            d_yaw = yaw_different
+        
+        yaw_diff_max_degree = 45
+        
+        if d_yaw > math.radians(yaw_diff_max_degree):
+            d_yaw = math.radians(yaw_diff_max_degree)
+        elif d_yaw < -math.radians(yaw_diff_max_degree):
+            d_yaw = -math.radians(yaw_diff_max_degree)
+
+        action = np.array([d_xy, -d_z, -d_yaw])
+
+        print("yaw_sp: {:.2f} yaw: {:.2f} yaw_diff: {:.2f} d_yaw: {:.2f}". \
+            format(math.degrees(yaw_setpoint), math.degrees(yaw_current), math.degrees(yaw_different), math.degrees(d_yaw)))
+
+        self.gazebo.pauseSim()
+
+        return action
 
     def point_transfer(self, x, y, theta):
         # transfer x, y to another frame
@@ -664,26 +789,48 @@ class PX4Env(gym.Env):
         return episode_done
 
     def _compute_reward(self, obs, done, action):
+        '''
+        get reward from action and obs
+        input action is unscaled action
+        '''
         reward = 0
         # get distance from goal position
         distance_now = self.get_distance_from_desired_point(self._current_pose.pose.position)
 
         if not done:
-            reward = self.previous_distance_from_des_point - distance_now - 0.1
+            reward_dist_old = self.previous_distance_from_des_point - distance_now
             self.previous_distance_from_des_point = distance_now
 
-            if self.control_method == 'vel':
-                action_punishment = 0.1 * (abs(action[-1]/self.vel_yaw_max))
-            else:
-                action_punishment = 0.1 * (abs(action[0]/self.acc_xy_max) + abs(action[-1]/self.acc_yaw_max))
+            # change reward according to the dist to goal
+            dist_coeff = (1 - np.clip(distance_now / self.goal_distance, 0, 1)) * 3
+            reward_dist =  dist_coeff * reward_dist_old
+            # print('dist: {:.2f} r_old: {:.2f} dist_coeff: {:.2f} r_new: {:.2f}'.format(distance_now, reward_dist_old, dist_coeff, reward_dist))
 
-            reward -= action_punishment
+            if self.action_num == 3:
+                action_punishment_1 = 0.0 * (1 - action[0]/self.vel_xy_max)
+                action_punishment_2 = 0.1 * abs(action[1] / self.vel_z_max)
+                action_punishment_3 = 0.1 * abs(action[2] / self.vel_yaw_max)
+                action_punishment_all = action_punishment_1 + action_punishment_2 + action_punishment_3
+            else:
+                action_punishment_1 = 0.0 * (1 - action[0]/self.vel_xy_max)
+                action_punishment_3 = 0.1 * abs(action[-1] / self.vel_yaw_max)
+                action_punishment_all = action_punishment_1 + action_punishment_3
+            reward = reward_dist - action_punishment_all
+
+            # print('reward: {:.2f} punishment: {:.2f} final: {:.2f}'.format(reward_dist, action_punishment_all, reward))
+
+            # if self.control_method == 'vel':
+            #     action_punishment = 0.1 * (abs(action[-1]/self.vel_yaw_max))
+            # else:
+            #     action_punishment = 0.1 * (abs(action[0]/self.acc_xy_max) + abs(action[-1]/self.acc_yaw_max))
+
+            # reward -= action_punishment
 
         else:
             if self.is_in_desired_pose():
-                reward = 10
+                reward = 2
             if self.too_close_to_obstacle():
-                reward = -5
+                reward = -2
 
         self._reward_pub.publish(reward)
 
@@ -923,31 +1070,45 @@ class PX4Env(gym.Env):
 
         self._goal_pose_pub.publish(self._goal_pose)
 
-    def publish_train_info(self, last_obs, action, obs, done, reward, total_reward):
+    def publish_train_info(self, last_obs, action, action_original, obs, done, reward, total_reward):
         info = TrainInfo()
         info.header.stamp = rospy.Time.now()
 
-        info.goal_position = self._goal_pose.pose.position
-        info.current_position = self._current_pose.pose.position
-
+        # Train info
         info.episode = self.episode_num
         info.step = self.step_num
         info.total_step = self.total_step
 
+        # Current state
+        info.goal_position = self._goal_pose.pose.position
+        info.current_position = self._current_pose.pose.position
+
         last_obs_feature = last_obs[..., -1]
         last_obs_feature = last_obs_feature[0, : self.state_length]
         
-
+        # obs
         obs_feature = obs[..., -1]
         obs_feature = obs_feature[0, : self.state_length]
 
         info.last_obs = last_obs_feature
         info.curr_obs = obs_feature
-        info.action = action
-        info.done = done
 
+        info.state_feature = self.state_feature_raw
+        info.state_feature_norm = self.state_feature_norm
+
+        info.min_dist_to_obs = self._depth_image_meter.min()
+
+        # action
+        info.action_scaled = scale_action(self.action_space, action)
+        info.action_unscaled = action
+        info.action_original = action_original
+
+        # reward        
         info.reward = reward
         info.total_reward = total_reward
+
+        # done
+        info.done = done
         
         self._train_info_pub.publish(info)
 
