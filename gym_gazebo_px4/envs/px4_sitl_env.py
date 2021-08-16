@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-05-18 19:06:06
+LastEditTime: 2021-05-18 11:40:21
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -129,7 +129,7 @@ class PX4Env(gym.Env):
         '''
         Settings for termination
         '''
-        self.max_episode_step = 800
+        self.max_episode_step = 100
         self.accept_radius = 1
         self.accept_velocity_norm = 0.2 # For velocity control at goal position
         
