@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-06-12 22:11:51
+LastEditTime: 2021-08-13 10:18:38
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -71,9 +71,9 @@ class PX4Env(gym.Env):
         self._local_vel_pub = rospy.Publisher('/mavros/setpoint_velocity/cmd_vel_test',TwistStamped, queue_size=10)
         self._local_pose_setpoint_pub = rospy.Publisher('/mavros/setpoint_position/local',PoseStamped, queue_size=10)
         self._goal_pose_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=10)
-        self._action_pub = rospy.Publisher('/network/action', TwistStamped, queue_size=10)
+        # self._action_pub = rospy.Publisher('/network/action', TwistStamped, queue_size=10)
         self._action_velocity_body_pub = rospy.Publisher('/mavros/setpoint_raw/local', PositionTarget, queue_size=10)
-        self._reward_pub = rospy.Publisher('/network/reward', Float32, queue_size=10)
+        # self._reward_pub = rospy.Publisher('/network/reward', Float32, queue_size=10)
         self._train_info_pub = rospy.Publisher('/environment/train_info', TrainInfo, queue_size=10)
 
         # image
@@ -267,26 +267,19 @@ class PX4Env(gym.Env):
     def _debugCb(self, event):
         pass
 
-# Methods for openai env
+# Methods for OpenAI GYM environment
     # -------------------------------
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
     def step(self, action, action_original):
-        # rospy.loginfo('state_raw: ' + np.array2string(self.state_feature_raw, formatter={'float_kind':lambda x: "%.2f" % x}))
-        # rospy.loginfo('state_norm: ' + np.array2string(self.state_feature_norm, formatter={'float_kind':lambda x: "%.2f" % x}))
-        # rospy.loginfo('action real: ' + np.array2string(action, formatter={'float_kind':lambda x: "%.2f" % x}))
+
         self.gazebo.unpauseSim()
         self.set_action_pose(action)
-        # rospy.loginfo('state_raw: ' + np.array2string(self.state_feature_raw, formatter={'float_kind':lambda x: "%.2f" % x}))
-        # rospy.loginfo('state_norm: ' + np.array2string(self.state_feature_norm, formatter={'float_kind':lambda x: "%.2f" % x}))
-        # rospy.loginfo('action real: ' + np.array2string(action, formatter={'float_kind':lambda x: "%.2f" % x}))
-        # rospy.loginfo('distance min: {:.2f} max: {:.2f}'.format(self._depth_image_meter.min(), self._depth_image_meter.max()))
-        # rospy.loginfo('action vel: ' + np.array2string(self.action_vel, formatter={'float_kind':lambda x: "%.2f" % x}))
         self.gazebo.pauseSim()
+
         obs = self._get_obs()
-        # obs = self._get_obs_mlp()
         done = self._is_done(obs)
         info = {
             'is_success': self.is_in_desired_pose(),
@@ -294,6 +287,7 @@ class PX4Env(gym.Env):
             'step_num': self.step_num
         }
         reward = self._compute_reward(obs, done, action)
+        
         self.cumulated_episode_reward += reward
         self.step_num += 1
         self.total_step += 1
@@ -319,7 +313,6 @@ class PX4Env(gym.Env):
 
         self._update_episode()
         obs = self._get_obs()
-        # obs = self._get_obs_mlp()
         self.last_obs = obs
         self.gazebo.pauseSim()
         rospy.logdebug("reset function out")
@@ -492,6 +485,60 @@ class PX4Env(gym.Env):
 
         return state_norm
 
+    def set_action_velocity(self, action):
+        """
+        Set linear and angular velocity according to action
+        """
+        use_avoidance_cmd = False
+
+        velocity_cmd_body = PositionTarget()
+        if use_avoidance_cmd:
+            # get avoidance output
+            # transfer _pose_avoidance_setpoint to velocity
+            current_pose = self._current_pose
+            desired_pose = self._pose_setpoint_avoidance
+
+            linear_velocity = Vector3()
+            linear_velocity.x = desired_pose.pose.position.x - current_pose.pose.position.x
+            linear_velocity.y = desired_pose.pose.position.y - current_pose.pose.position.y
+            linear_velocity.z = desired_pose.pose.position.z - current_pose.pose.position.z
+
+            forward_speed = math.sqrt(pow(linear_velocity.x, 2) + pow(linear_velocity.y, 2))
+            if forward_speed > self.forward_speed_max:
+                forward_speed = self.forward_speed_max
+
+            angular_velocity = Vector3()
+            angular_velocity.x = 0
+            angular_velocity.y = 0
+            explicit_quat1 = [desired_pose.pose.orientation.x, desired_pose.pose.orientation.y, desired_pose.pose.orientation.z, \
+                                desired_pose.pose.orientation.w]
+            explicit_quat2 = [current_pose.pose.orientation.x, current_pose.pose.orientation.y, \
+                                current_pose.pose.orientation.z, current_pose.pose.orientation.w]
+            yaw_setpoint = euler_from_quaternion(explicit_quat1)[2]
+            yaw_current = euler_from_quaternion(explicit_quat2)[2]
+            angular_velocity.z = self.getAngularVelocity(yaw_setpoint, yaw_current)
+
+            velocity_cmd_body.type_mask = 1475
+            velocity_cmd_body.coordinate_frame = 8
+            velocity_cmd_body.position.z = 3
+            velocity_cmd_body.velocity.x = 0
+            velocity_cmd_body.velocity.y = forward_speed
+            velocity_cmd_body.velocity.z = 0
+            velocity_cmd_body.yaw_rate = angular_velocity.z
+
+        else:
+            velocity_cmd_body.type_mask = 1475
+            velocity_cmd_body.coordinate_frame = 8
+            velocity_cmd_body.position.z = self.takeoff_hight
+            velocity_cmd_body.velocity.x = 0
+            velocity_cmd_body.velocity.y = action[0]
+            velocity_cmd_body.velocity.z = 0
+            velocity_cmd_body.yaw_rate = action[1]
+
+        self._action_velocity_body_pub.publish(velocity_cmd_body)
+
+        self._rate.sleep()
+    
     def _set_action(self, action):
         """
         This set action will Set the linear and angular speed of the drone
@@ -832,7 +879,7 @@ class PX4Env(gym.Env):
             if self.too_close_to_obstacle():
                 reward = -2
 
-        self._reward_pub.publish(reward)
+        # self._reward_pub.publish(reward)
 
         return reward
 
