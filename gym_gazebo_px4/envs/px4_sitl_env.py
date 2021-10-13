@@ -1,13 +1,13 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-08-13 10:18:38
+LastEditTime: 2021-09-27 23:03:53
 Description: 
 Github: https://github.com/heleidsn
 '''
-from pickle import TRUE
+import torch as th
 import gym
-from gym import error, spaces, utils
+from gym import spaces
 from gym.utils import seeding
 import numpy as np
 import random
@@ -21,22 +21,19 @@ from .gazebo_connection import GazeboConnection
 
 from cv_bridge import CvBridge, CvBridgeError
 
-from mavros_msgs.msg import State, ParamValue, PositionTarget
+from mavros_msgs.msg import State, PositionTarget
 from sensor_msgs.msg import NavSatFix
-from mavros_msgs.srv import ParamSet, ParamGet, SetMode, CommandBool, CommandBoolRequest, CommandTOL, CommandHome
-from geometry_msgs.msg import PoseStamped, TwistStamped, Quaternion, Vector3
+from mavros_msgs.srv import ParamSet, SetMode, CommandBool, CommandTOL, CommandHome
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3
 from sensor_msgs.msg import Image
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from nav_msgs.msg import Odometry
-from td3fd.msg import TrainInfo, AssistedInfo
+from td3fd.msg import TrainInfo
 
 from visualization_msgs.msg import Marker
 
-from std_msgs.msg import Float32
-
 import subprocess32 as subprocess
 
-from stable_baselines.common.math_util import unscale_action, scale_action
 
 
 class PX4Env(gym.Env):
@@ -58,6 +55,8 @@ class PX4Env(gym.Env):
 
         self.max_depth_meter_gazebo = 10
 
+        self.model = None
+
         # Subscribers 
         rospy.Subscriber('mavros/state', State, callback=self._stateCb, queue_size=10)
         rospy.Subscriber('mavros/local_position/pose', PoseStamped , callback=self._poseCb, queue_size=10)
@@ -71,9 +70,7 @@ class PX4Env(gym.Env):
         self._local_vel_pub = rospy.Publisher('/mavros/setpoint_velocity/cmd_vel_test',TwistStamped, queue_size=10)
         self._local_pose_setpoint_pub = rospy.Publisher('/mavros/setpoint_position/local',PoseStamped, queue_size=10)
         self._goal_pose_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=10)
-        # self._action_pub = rospy.Publisher('/network/action', TwistStamped, queue_size=10)
         self._action_velocity_body_pub = rospy.Publisher('/mavros/setpoint_raw/local', PositionTarget, queue_size=10)
-        # self._reward_pub = rospy.Publisher('/network/reward', Float32, queue_size=10)
         self._train_info_pub = rospy.Publisher('/environment/train_info', TrainInfo, queue_size=10)
 
         # image
@@ -117,7 +114,7 @@ class PX4Env(gym.Env):
         '''
         self.goal_angle_noise_degree = 180  # random goal direction
         self.random_start_direction = True
-        self.goal_distance = 50
+        self.goal_distance = 30
         self._goal_pose = PoseStamped()
 
         '''
@@ -131,7 +128,7 @@ class PX4Env(gym.Env):
         '''
         Settings for termination
         '''
-        self.max_episode_step = 500
+        self.max_episode_step = 800
         self.accept_radius = 2
         self.accept_velocity_norm = 0.2 # For velocity control at goal position
         
@@ -149,7 +146,7 @@ class PX4Env(gym.Env):
         observation space
         '''
         self.screen_height = 80
-        self.screen_width = 100
+        self.screen_width = 96
         
         self.observation_space = spaces.Box(low=0, high=255, shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
 
@@ -161,8 +158,8 @@ class PX4Env(gym.Env):
         action space
         '''
         # output forward vertital speed and yaw rate
-        self.vel_xy_max = 3
-        self.vel_xy_min = 0
+        self.vel_xy_max = 2
+        self.vel_xy_min = 0.5
         self.vel_z_max = 1
         self.vel_yaw_max = math.radians(30)
 
@@ -246,7 +243,7 @@ class PX4Env(gym.Env):
 
         # deal with nan
         image[np.isnan(image)] = self.max_depth_meter_gazebo
-        image_small = cv2.resize(image, (100, 80), interpolation = cv2.INTER_AREA)
+        image_small = cv2.resize(image, (96, 80), interpolation = cv2.INTER_AREA)
         self._depth_image_meter = np.copy(image_small)
 
         # get image gray (0-255)
@@ -273,26 +270,26 @@ class PX4Env(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def step(self, action, action_original):
+    def step(self, action):
 
         self.gazebo.unpauseSim()
-        self.set_action_pose(action)
+        self.set_action_velocity(action)
         self.gazebo.pauseSim()
 
         obs = self._get_obs()
         done = self._is_done(obs)
         info = {
             'is_success': self.is_in_desired_pose(),
-            'is_crash': self.too_close_to_obstacle() or not self.is_inside_workspace(),
+            'is_crash': self.too_close_to_obstacle(),
             'step_num': self.step_num
         }
-        reward = self._compute_reward(obs, done, action)
+        reward = self._compute_reward_new(obs, done, action)
         
         self.cumulated_episode_reward += reward
         self.step_num += 1
         self.total_step += 1
 
-        self.publish_train_info(self.last_obs, action, action_original, obs, done, reward, self.cumulated_episode_reward)
+        self.publish_train_info(self.last_obs, action, obs, done, reward, self.cumulated_episode_reward)
         self.last_obs = obs
     
         return obs, reward, done, info
@@ -489,9 +486,12 @@ class PX4Env(gym.Env):
         """
         Set linear and angular velocity according to action
         """
+
+        # print('action_ori: ', action)
         use_avoidance_cmd = False
 
         velocity_cmd_body = PositionTarget()
+        
         if use_avoidance_cmd:
             # get avoidance output
             # transfer _pose_avoidance_setpoint to velocity
@@ -527,15 +527,29 @@ class PX4Env(gym.Env):
             velocity_cmd_body.yaw_rate = angular_velocity.z
 
         else:
-            velocity_cmd_body.type_mask = 1475
-            velocity_cmd_body.coordinate_frame = 8
-            velocity_cmd_body.position.z = self.takeoff_hight
-            velocity_cmd_body.velocity.x = 0
-            velocity_cmd_body.velocity.y = action[0]
-            velocity_cmd_body.velocity.z = 0
-            velocity_cmd_body.yaw_rate = action[1]
-
+            if self.action_num == 2:
+                # for 2D navigation
+                velocity_cmd_body.type_mask = 1475
+                velocity_cmd_body.coordinate_frame = 8
+                velocity_cmd_body.position.z = self.takeoff_hight
+                velocity_cmd_body.velocity.x = action[0]
+                velocity_cmd_body.velocity.y = 0
+                velocity_cmd_body.velocity.z = 0
+                velocity_cmd_body.yaw_rate = action[-1]
+            elif self.action_num == 3:
+                # for 3D navigation
+                velocity_cmd_body.type_mask = 1479
+                velocity_cmd_body.coordinate_frame = 8
+                velocity_cmd_body.velocity.x = action[0]
+                velocity_cmd_body.velocity.y = 0
+                velocity_cmd_body.velocity.z = action[1]
+                velocity_cmd_body.yaw_rate = action[-1]
+            else:
+                print('action num error')
+        
         self._action_velocity_body_pub.publish(velocity_cmd_body)
+        self.publish_marker_velocity_pose(action)
+        self.publish_marker_goal_pose(self._goal_pose)
 
         self._rate.sleep()
     
@@ -693,6 +707,51 @@ class PX4Env(gym.Env):
         marker.color.b = 1.0
 
         self._goal_pose_marker_pub.publish(marker)
+
+    def publish_marker_velocity_pose(self, action):
+        d_xy = action[0]
+        d_z = action[1]
+        d_yaw = action[-1]
+        current_yaw = self.get_current_yaw()
+        yaw_setpoint = current_yaw + d_yaw
+
+        dx_body = d_xy
+        dy_body = 0
+        dx_local, dy_local = self.point_transfer(dx_body, dy_body, -yaw_setpoint)
+
+        pose_setpoint = PoseStamped()
+        pose_setpoint.pose.position.x = self._current_pose.pose.position.x + dx_local
+        pose_setpoint.pose.position.y = self._current_pose.pose.position.y + dy_local
+        if self.action_num == 3:
+            pose_setpoint.pose.position.z = self._current_pose.pose.position.z + d_z
+        elif self.action_num == 2:
+            pose_setpoint.pose.position.z = self.takeoff_hight
+
+        orientation_setpoint = quaternion_from_euler(0, 0, yaw_setpoint)
+        pose_setpoint.pose.orientation.x = orientation_setpoint[0]
+        pose_setpoint.pose.orientation.y = orientation_setpoint[1]
+        pose_setpoint.pose.orientation.z = orientation_setpoint[2]
+        pose_setpoint.pose.orientation.w = orientation_setpoint[3]
+
+        marker_network_setpoint = Marker()
+        marker_network_setpoint.header.stamp = rospy.Time.now()
+        marker_network_setpoint.header.frame_id = 'local_origin'
+        marker_network_setpoint.type = Marker.SPHERE
+        marker_network_setpoint.action = Marker.ADD
+        marker_network_setpoint.pose.position = pose_setpoint.pose.position
+        marker_network_setpoint.pose.orientation.x = 0.0
+        marker_network_setpoint.pose.orientation.y = 0.0
+        marker_network_setpoint.pose.orientation.z = 0.0
+        marker_network_setpoint.pose.orientation.w = 1.0
+        marker_network_setpoint.scale.x = 0.3
+        marker_network_setpoint.scale.y = 0.3
+        marker_network_setpoint.scale.z = 0.3
+        marker_network_setpoint.color.a = 0.8
+        marker_network_setpoint.color.r = 0.0
+        marker_network_setpoint.color.g = 0.0
+        marker_network_setpoint.color.b = 0.0
+
+        self._setpoint_marker_pub.publish(marker_network_setpoint)
 
     def get_avoidance_output_state_old(self):
         """
@@ -875,13 +934,93 @@ class PX4Env(gym.Env):
 
         else:
             if self.is_in_desired_pose():
-                reward = 2
+                reward = 10
             if self.too_close_to_obstacle():
-                reward = -2
+                reward = -10
 
         # self._reward_pub.publish(reward)
 
         return reward
+
+    def _compute_reward_new(self, obs, done, action):
+        '''
+        get reward from action and obs
+        input action is unscaled action
+        总结一下 ：
+        1. 稀疏奖励：到达 10 碰撞 -10 出圈 -10
+        2. 连续奖励：
+            距离缩小 总70
+        3. 惩罚：
+            位置惩罚：离直线越近越好（分为水平和高度）
+            动作惩罚：动作越小越好
+            *时间惩罚：隐性，时间越长上面的惩罚越大
+            障碍物惩罚：接近障碍物会有惩罚（尽量远离）
+        '''
+        reward = 0
+        # get distance from goal position
+        distance_now = self.get_distance_from_desired_point(self._current_pose.pose.position)
+
+        if not done:
+            # 计算连续奖励
+            reward_dist_old = self.previous_distance_from_des_point - distance_now
+            self.previous_distance_from_des_point = distance_now
+
+            # change reward according to the dist to goal
+            # dist_coeff = (1 - np.clip(distance_now / self.goal_distance, 0, 1)) * 3
+            dist_coeff = 1
+            reward_dist =  dist_coeff * reward_dist_old
+            # reward_dist = math.exp(-distance_now*distance_now/50)
+
+            # Position Punishment
+            x = self._current_pose.pose.position.x
+            y = self._current_pose.pose.position.y
+            z = self._current_pose.pose.position.z
+            x_g = self._goal_pose.pose.position.x
+            y_g = self._goal_pose.pose.position.y
+            z_g = self._goal_pose.pose.position.z
+            punishment_xy = np.clip(self.getDis(x, y, 0, 0, x_g, y_g) / 10, 0, 1)
+            punishment_z = 0.5 * np.clip((z - z_g)/5, 0, 1)
+
+            punishment_pose = punishment_xy
+
+            # Action punishment
+            if self.action_num == 3:
+                action_punishment_1 = 0.0 * (1 - action[0]/self.vel_xy_max)
+                action_punishment_2 = 0.05 * abs(action[1] / self.vel_z_max)
+                action_punishment_3 = 0.05 * abs(action[2] / self.vel_yaw_max)
+                punishment_action = action_punishment_1 + action_punishment_2 + action_punishment_3
+            else:
+                action_punishment_1 = 0.0 * (1 - action[0]/self.vel_xy_max)
+                action_punishment_2 = 0
+                action_punishment_3 = abs(action[-1] / self.vel_yaw_max)
+                punishment_action = action_punishment_1 + action_punishment_3
+
+            # Obstacle punishment
+            punishment_obs = 1 - np.clip((self._depth_image_meter.min() - self.min_dist_to_obs_meters) / 5, 0, 1)
+            # print(punishment_obs)
+            reward = reward_dist - 0.05 * punishment_action - 0.1 * punishment_pose - 0.1 * punishment_obs*punishment_obs
+            # reward = reward_dist - punishment_pose - punishment_action
+            # reward = reward_dist - 0.01
+
+            # print('r_dis: {:.2f} p_xy: {:.2f} p_z: {:.2f} p_a2: {:.2f} p_a3: {:.2f} r_all: {:.2f}'.format(
+            #     reward_dist, punishment_xy, punishment_z, action_punishment_2, action_punishment_3, reward
+            # ))
+
+        else:
+            if self.is_in_desired_pose():
+                reward = 5
+            if self.too_close_to_obstacle() or not self.is_inside_workspace():
+                reward = -5
+
+        return reward
+
+    def update_goal_distance(self, goal_dist):
+        self.goal_distance = goal_dist
+        self.work_space_x_max = self.goal_distance + 10
+        self.work_space_x_min = -self.work_space_x_max
+        self.work_space_y_max = self.work_space_x_max
+        self.work_space_y_min = -self.work_space_x_max
+        print('goal dist is set to : ', self.goal_distance)
 
 # Methods for PX4 control
     # --------------------------------------------
@@ -1017,6 +1156,18 @@ class PX4Env(gym.Env):
         distance = np.linalg.norm(a - b)
 
         return distance
+    
+    def getDis(self,pointX,pointY,lineX1,lineY1,lineX2,lineY2):
+        '''
+        Get distance between Point and Line
+        Used to calculate position punishment
+        '''
+        a=lineY2-lineY1
+        b=lineX1-lineX2
+        c=lineX2*lineY1-lineX1*lineY2
+        dis=(math.fabs(a*pointX+b*pointY+c))/(math.pow(a*a+b*b,0.5))
+        
+        return dis
 
     def too_close_to_obstacle(self):
         """
@@ -1117,7 +1268,7 @@ class PX4Env(gym.Env):
 
         self._goal_pose_pub.publish(self._goal_pose)
 
-    def publish_train_info(self, last_obs, action, action_original, obs, done, reward, total_reward):
+    def publish_train_info(self, last_obs, action, obs, done, reward, total_reward):
         info = TrainInfo()
         info.header.stamp = rospy.Time.now()
 
@@ -1140,15 +1291,14 @@ class PX4Env(gym.Env):
         info.last_obs = last_obs_feature
         info.curr_obs = obs_feature
 
-        info.state_feature = self.state_feature_raw
-        info.state_feature_norm = self.state_feature_norm
+        info.state_feature = self.all_state_raw
+        info.state_feature_norm = self.state_feature_norm*2 - 1
 
         info.min_dist_to_obs = self._depth_image_meter.min()
 
         # action
-        info.action_scaled = scale_action(self.action_space, action)
+        info.action_scaled = self.scale_action(self.action_space, action)
         info.action_unscaled = action
-        info.action_original = action_original
 
         # reward        
         info.reward = reward
@@ -1156,6 +1306,46 @@ class PX4Env(gym.Env):
 
         # done
         info.done = done
-        
+
+        use_ppo = False
+
+        # model
+        if self.model is not None:
+            with th.no_grad():
+                unscaled_action, _ = self.model.predict(last_obs, deterministic=False)
+                info.action_original = unscaled_action
+
+                if use_ppo == True:
+                    feature_all = self.model.policy.features_extractor.feature_all.cpu().numpy()[0]
+                    info.feature_all = feature_all
+                else:
+                    # get feature all
+                    feature_all = self.model.actor.features_extractor.feature_all.cpu().numpy()[0]
+                    info.feature_all = feature_all
+
+                    last_obs = last_obs.swapaxes(0, 1)
+                    last_obs = last_obs.swapaxes(0, 2)
+
+                    # get q-value for td3
+                    q_value_current = self.model.critic(th.from_numpy(last_obs[[None]]).float().cuda(), th.from_numpy(action[None]).float().cuda())
+                    # info.q_value_current = q_value_current.cpu().numpy()[0]
+                    # print(q_value_current.cpu().numpy()[0], type(q_value_current.cpu().numpy()[0]))
+                    q_1 = q_value_current[0].cpu().numpy()[0]
+                    q_2 = q_value_current[1].cpu().numpy()[0]
+                    info.q_value_current = np.array([q_1, q_2])
+                    info.q_value_next = np.array([0, 0])
+
         self._train_info_pub.publish(info)
+
+    def scale_action(self, action_space, action):
+        """
+        Rescale the action from [low, high] to [-1, 1]
+        (no need for symmetric action space)
+
+        :param action_space: (gym.spaces.box.Box)
+        :param action: (np.ndarray)
+        :return: (np.ndarray)
+        """
+        low, high = action_space.low, action_space.high
+        return 2.0 * ((action - low) / (high - low)) - 1.0  
 
