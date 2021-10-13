@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-09-27 23:03:53
+LastEditTime: 2021-10-13 15:35:12
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -56,6 +56,7 @@ class PX4Env(gym.Env):
         self.max_depth_meter_gazebo = 10
 
         self.model = None
+        self.use_ppo = False  # check if use ppo or other algos, used only for visualization
 
         # Subscribers 
         rospy.Subscriber('mavros/state', State, callback=self._stateCb, queue_size=10)
@@ -148,7 +149,7 @@ class PX4Env(gym.Env):
         self.screen_height = 80
         self.screen_width = 96
         
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
+        self.observation_space = spaces.Box(low=np.float32(0), high=np.float32(255), shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
 
         self._state_raw = np.zeros(self.state_length)
         self._state_norm = np.zeros(self.state_length)
@@ -1098,7 +1099,7 @@ class PX4Env(gym.Env):
                                                     altitude=self._current_gps.altitude)
 
         while not ret_sethome.success:
-            rospy.logwarn("Failed to set home, try again")
+            # rospy.logwarn("Failed to set home, try again")
             ret_sethome = self._set_home_client(current_gps=True, latitude=self._current_gps.latitude, longitude=self._current_gps.longitude, \
                                                     altitude=self._current_gps.altitude)
         
@@ -1307,15 +1308,13 @@ class PX4Env(gym.Env):
         # done
         info.done = done
 
-        use_ppo = False
-
         # model
         if self.model is not None:
             with th.no_grad():
                 unscaled_action, _ = self.model.predict(last_obs, deterministic=False)
                 info.action_original = unscaled_action
 
-                if use_ppo == True:
+                if self.use_ppo == True:
                     feature_all = self.model.policy.features_extractor.feature_all.cpu().numpy()[0]
                     info.feature_all = feature_all
                 else:
@@ -1327,7 +1326,7 @@ class PX4Env(gym.Env):
                     last_obs = last_obs.swapaxes(0, 2)
 
                     # get q-value for td3
-                    q_value_current = self.model.critic(th.from_numpy(last_obs[[None]]).float().cuda(), th.from_numpy(action[None]).float().cuda())
+                    q_value_current = self.model.critic(th.from_numpy(last_obs[tuple([None])]).float().cuda(), th.from_numpy(action[None]).float().cuda())
                     # info.q_value_current = q_value_current.cpu().numpy()[0]
                     # print(q_value_current.cpu().numpy()[0], type(q_value_current.cpu().numpy()[0]))
                     q_1 = q_value_current[0].cpu().numpy()[0]
