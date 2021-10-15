@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-10-13 15:35:12
+LastEditTime: 2021-10-14 12:10:45
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -147,7 +147,7 @@ class PX4Env(gym.Env):
         observation space
         '''
         self.screen_height = 80
-        self.screen_width = 96
+        self.screen_width = 100
         
         self.observation_space = spaces.Box(low=np.float32(0), high=np.float32(255), shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
 
@@ -244,7 +244,7 @@ class PX4Env(gym.Env):
 
         # deal with nan
         image[np.isnan(image)] = self.max_depth_meter_gazebo
-        image_small = cv2.resize(image, (96, 80), interpolation = cv2.INTER_AREA)
+        image_small = cv2.resize(image, (self.screen_width, self.screen_height), interpolation = cv2.INTER_AREA)
         self._depth_image_meter = np.copy(image_small)
 
         # get image gray (0-255)
@@ -1322,6 +1322,8 @@ class PX4Env(gym.Env):
                     feature_all = self.model.actor.features_extractor.feature_all.cpu().numpy()[0]
                     info.feature_all = feature_all
 
+                    # cnn_map = self.model.actor.features_extractor.cnn.cpu()
+
                     last_obs = last_obs.swapaxes(0, 1)
                     last_obs = last_obs.swapaxes(0, 2)
 
@@ -1333,6 +1335,12 @@ class PX4Env(gym.Env):
                     q_2 = q_value_current[1].cpu().numpy()[0]
                     info.q_value_current = np.array([q_1, q_2])
                     info.q_value_next = np.array([0, 0])
+
+                    q_value = min(q_1, q_2)[0]
+
+                    self.visual_log_q_value(q_value, action, reward)
+
+                    
 
         self._train_info_pub.publish(info)
 
@@ -1347,4 +1355,53 @@ class PX4Env(gym.Env):
         """
         low, high = action_space.low, action_space.high
         return 2.0 * ((action - low) / (high - low)) - 1.0  
+    
+    def visual_log_q_value(self, q_value, action, reward):
+        '''
+        Create grid map (map_size = work_space)
+        Log Q value and the best action in grid map
+        At any grid position, record:
+        1. Q value
+        2. action 0
+        3. action 1
+        4. steps
+        5. reward
+        Save image every 10k steps
+        '''
+
+        # create init array if not exist 
+        map_size = self.work_space_x_max*2 + 1
+        if not hasattr(self, 'q_value_map'):
+            self.q_value_map = np.full((5, map_size, map_size), np.nan)
+        
+        # record info
+        pose_x = self._current_pose.pose.position.x
+        pose_y = self._current_pose.pose.position.y
+        pose_z = self._current_pose.pose.position.z # used for 3D case
+
+        index_x = int(np.round(pose_x) + self.work_space_x_max)
+        index_y = int(np.round(pose_y) + self.work_space_x_max)
+
+        # check if index valid
+        if index_x in range(0, map_size) and index_y in range(0, map_size):
+            self.q_value_map[0, index_x, index_y] = q_value
+            self.q_value_map[1, index_x, index_y] = action[0]
+            self.q_value_map[2, index_x, index_y] = action[1]
+            self.q_value_map[3, index_x, index_y] = self.total_step
+            self.q_value_map[4, index_x, index_y] = reward
+        else:
+            print('Error: X:{} and Y:{} is outside of range 0~mapsize (visual_log_q_value)')
+
+        # save array every record_step steps 
+        record_step = 5000
+        if self.total_step % record_step == 0:
+            np.save('q_value_map_{}'.format(self.total_step), self.q_value_map)
+
+
+    def visual_CNN_heat_maps(self):
+        '''
+        Generate CNN heat maps for every layers
+        Output all weights and bias
+        Output gradient
+        '''
 
