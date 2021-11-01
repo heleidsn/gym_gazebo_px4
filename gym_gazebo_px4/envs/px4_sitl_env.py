@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-10-14 12:10:45
+LastEditTime: 2021-11-01 08:13:35
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -29,6 +29,7 @@ from sensor_msgs.msg import Image
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from nav_msgs.msg import Odometry
 from td3fd.msg import TrainInfo
+from td3fd.msg import FeatureMaps
 
 from visualization_msgs.msg import Marker
 
@@ -57,6 +58,7 @@ class PX4Env(gym.Env):
 
         self.model = None
         self.use_ppo = False  # check if use ppo or other algos, used only for visualization
+        self.policy = None
 
         # Subscribers 
         rospy.Subscriber('mavros/state', State, callback=self._stateCb, queue_size=10)
@@ -73,6 +75,7 @@ class PX4Env(gym.Env):
         self._goal_pose_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=10)
         self._action_velocity_body_pub = rospy.Publisher('/mavros/setpoint_raw/local', PositionTarget, queue_size=10)
         self._train_info_pub = rospy.Publisher('/environment/train_info', TrainInfo, queue_size=10)
+        self.feature_maps_pub = rospy.Publisher('/environment/feature_maps', FeatureMaps, queue_size=10)
 
         # image
         self._depth_image_gray_input = rospy.Publisher('network/depth_image_input', Image, queue_size=10)
@@ -1000,6 +1003,7 @@ class PX4Env(gym.Env):
             punishment_obs = 1 - np.clip((self._depth_image_meter.min() - self.min_dist_to_obs_meters) / 5, 0, 1)
             # print(punishment_obs)
             reward = reward_dist - 0.05 * punishment_action - 0.1 * punishment_pose - 0.1 * punishment_obs*punishment_obs
+            # reward = reward * 10
             # reward = reward_dist - punishment_pose - punishment_action
             # reward = reward_dist - 0.01
 
@@ -1009,9 +1013,9 @@ class PX4Env(gym.Env):
 
         else:
             if self.is_in_desired_pose():
-                reward = 5
+                reward = 10
             if self.too_close_to_obstacle() or not self.is_inside_workspace():
-                reward = -5
+                reward = -10
 
         return reward
 
@@ -1311,26 +1315,31 @@ class PX4Env(gym.Env):
         # model
         if self.model is not None:
             with th.no_grad():
-                unscaled_action, _ = self.model.predict(last_obs, deterministic=False)
+                unscaled_action, _ = self.model.predict(last_obs, deterministic=False)  # 在需要得到feature的时候，要对model进行一次传播
                 info.action_original = unscaled_action
 
                 if self.use_ppo == True:
                     feature_all = self.model.policy.features_extractor.feature_all.cpu().numpy()[0]
                     info.feature_all = feature_all
+                    
+                    if self.policy == 'cnn_mobile':
+                        gap_out = self.model.policy.features_extractor.gap_out.cpu().numpy()[0].reshape(-1)
+                        info.gap_out = gap_out[0:20]
+                    # if self.policy == 'no_cnn':
+                    #     print('a')
                 else:
                     # get feature all
                     feature_all = self.model.actor.features_extractor.feature_all.cpu().numpy()[0]
                     info.feature_all = feature_all
 
-                    # cnn_map = self.model.actor.features_extractor.cnn.cpu()
-
-                    last_obs = last_obs.swapaxes(0, 1)
-                    last_obs = last_obs.swapaxes(0, 2)
+                    if self.policy == 'cnn_mobile':
+                        gap_out = self.model.actor.features_extractor.gap_layer_out.cpu().numpy()[0].reshape(-1)
+                        info.gap_out = gap_out[0:20]
 
                     # get q-value for td3
+                    last_obs = last_obs.swapaxes(0, 1)
+                    last_obs = last_obs.swapaxes(0, 2)
                     q_value_current = self.model.critic(th.from_numpy(last_obs[tuple([None])]).float().cuda(), th.from_numpy(action[None]).float().cuda())
-                    # info.q_value_current = q_value_current.cpu().numpy()[0]
-                    # print(q_value_current.cpu().numpy()[0], type(q_value_current.cpu().numpy()[0]))
                     q_1 = q_value_current[0].cpu().numpy()[0]
                     q_2 = q_value_current[1].cpu().numpy()[0]
                     info.q_value_current = np.array([q_1, q_2])
@@ -1340,7 +1349,8 @@ class PX4Env(gym.Env):
 
                     self.visual_log_q_value(q_value, action, reward)
 
-                    
+                    if self.policy == 'cnn_gap':
+                        self.visual_CNN_heat_maps(last_obs)
 
         self._train_info_pub.publish(info)
 
@@ -1372,7 +1382,7 @@ class PX4Env(gym.Env):
         # create init array if not exist 
         map_size = self.work_space_x_max*2 + 1
         if not hasattr(self, 'q_value_map'):
-            self.q_value_map = np.full((5, map_size, map_size), np.nan)
+            self.q_value_map = np.full((9, map_size, map_size), np.nan)
         
         # record info
         pose_x = self._current_pose.pose.position.x
@@ -1389,6 +1399,10 @@ class PX4Env(gym.Env):
             self.q_value_map[2, index_x, index_y] = action[1]
             self.q_value_map[3, index_x, index_y] = self.total_step
             self.q_value_map[4, index_x, index_y] = reward
+            self.q_value_map[5, index_x, index_y] = q_value
+            self.q_value_map[6, index_x, index_y] = action[0]
+            self.q_value_map[7, index_x, index_y] = action[1]
+            self.q_value_map[8, index_x, index_y] = reward
         else:
             print('Error: X:{} and Y:{} is outside of range 0~mapsize (visual_log_q_value)')
 
@@ -1396,12 +1410,43 @@ class PX4Env(gym.Env):
         record_step = 5000
         if self.total_step % record_step == 0:
             np.save('q_value_map_{}'.format(self.total_step), self.q_value_map)
+            # refresh 5 6 7 8 to record period data
+            self.q_value_map[5, :, :] = np.nan
+            self.q_value_map[6, :, :] = np.nan
+            self.q_value_map[7, :, :] = np.nan
+            self.q_value_map[8, :, :] = np.nan
 
 
-    def visual_CNN_heat_maps(self):
+    def visual_CNN_heat_maps(self, obs_used):
         '''
         Generate CNN heat maps for every layers
         Output all weights and bias
         Output gradient
         '''
 
+        step = self.total_step
+        obs = obs_used
+        
+        layer_1_out = self.model.actor.features_extractor.layer_1_out.cpu().numpy()[0]      # (8, 40, 50)
+        layer_2_out = self.model.actor.features_extractor.layer_2_out.cpu().numpy()[0]      # (8, 20, 25)
+        layer_3_out = self.model.actor.features_extractor.layer_3_out.cpu().numpy()[0]      # (8, 10, 12)
+        gap_layer_out = self.model.actor.features_extractor.gap_layer_out.cpu().numpy()[0]  # (8, 1, 1)
+
+        msg = FeatureMaps()
+        msg.header.stamp = rospy.Time.now()
+
+        msg.obs = obs.reshape(-1)    # (2, 80, 100)
+
+        msg.layer_1_out = layer_1_out.reshape(-1)
+        msg.layer_2_out = layer_2_out.reshape(-1)
+        msg.layer_3_out = layer_3_out.reshape(-1)
+        msg.gap_layer_out = gap_layer_out.reshape(-1)
+
+        msg.w_1 = self.model.actor.features_extractor.conv1[0].weight.cpu().numpy().reshape(-1)         # (8, 1, 3, 3)
+        msg.b_1 = self.model.actor.features_extractor.conv1[0].bias.cpu().numpy().reshape(-1)
+        msg.w_2 = self.model.actor.features_extractor.conv2[0].weight.cpu().numpy().reshape(-1)         # (8, 1, 3, 3)
+        msg.b_2 = self.model.actor.features_extractor.conv2[0].bias.cpu().numpy().reshape(-1)
+        msg.w_3 = self.model.actor.features_extractor.conv3[0].weight.cpu().numpy().reshape(-1)         # (8, 1, 3, 3)
+        msg.b_3 = self.model.actor.features_extractor.conv3[0].bias.cpu().numpy().reshape(-1)
+
+        self.feature_maps_pub.publish(msg)
