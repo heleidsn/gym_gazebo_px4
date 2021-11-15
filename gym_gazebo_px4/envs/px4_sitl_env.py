@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-11-01 08:13:35
+LastEditTime: 2021-11-09 09:30:45
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -118,7 +118,7 @@ class PX4Env(gym.Env):
         '''
         self.goal_angle_noise_degree = 180  # random goal direction
         self.random_start_direction = True
-        self.goal_distance = 30
+        self.goal_distance = 60
         self._goal_pose = PoseStamped()
 
         '''
@@ -1002,7 +1002,7 @@ class PX4Env(gym.Env):
             # Obstacle punishment
             punishment_obs = 1 - np.clip((self._depth_image_meter.min() - self.min_dist_to_obs_meters) / 5, 0, 1)
             # print(punishment_obs)
-            reward = reward_dist - 0.05 * punishment_action - 0.1 * punishment_pose - 0.1 * punishment_obs*punishment_obs
+            reward = reward_dist - 0.05 * punishment_action - 0.01 * punishment_pose - 0.01 * punishment_obs*punishment_obs
             # reward = reward * 10
             # reward = reward_dist - punishment_pose - punishment_action
             # reward = reward_dist - 0.01
