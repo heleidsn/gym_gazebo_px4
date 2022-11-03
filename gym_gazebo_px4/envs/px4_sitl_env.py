@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2021-11-09 09:30:45
+LastEditTime: 2022-11-03 22:59:45
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -25,6 +25,7 @@ from mavros_msgs.msg import State, PositionTarget
 from sensor_msgs.msg import NavSatFix
 from mavros_msgs.srv import ParamSet, SetMode, CommandBool, CommandTOL, CommandHome
 from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3
+from mavros_msgs.srv import CommandHome, CommandLong
 from sensor_msgs.msg import Image
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from nav_msgs.msg import Odometry
@@ -76,6 +77,8 @@ class PX4Env(gym.Env):
         self._action_velocity_body_pub = rospy.Publisher('/mavros/setpoint_raw/local', PositionTarget, queue_size=10)
         self._train_info_pub = rospy.Publisher('/environment/train_info', TrainInfo, queue_size=10)
         self.feature_maps_pub = rospy.Publisher('/environment/feature_maps', FeatureMaps, queue_size=10)
+        self._mavros_cmd_client = rospy.ServiceProxy('/mavros/cmd/command',
+                                                     CommandLong)
 
         # image
         self._depth_image_gray_input = rospy.Publisher('network/depth_image_input', Image, queue_size=10)
@@ -341,17 +344,24 @@ class PX4Env(gym.Env):
         遇到问题：
         stop ekf2之后出现断开连接，无法重新连接。。。。
         估计是需要旧版本固件。。。
+        
+        update 11-03:
+        发现其实新版本固件是可以用的，但是在stop ekf之后，无法使用rospy.sleep()函数
+        因为stop ekf之后，系统整个的仿真变得慢，所以每次stop之后直接start即可
         """
         rospy.logdebug("RESET SIM START --- DONT RESET CONTROLLERS")
         
         # 1. disarm
-        self.gazebo.pauseSim()
         self.gazebo.unpauseSim()
-        self._arming_client.call(False)
+        rospy.logdebug('waiting for disarm...')
+        self.DisarmForce()
+        rospy.logdebug('disarm ok...')
         self.gazebo.pauseSim()
 
         # 2. reset sim 
+        rospy.logdebug('reset sim...')
         self.gazebo.resetSim()
+        rospy.logdebug('reset sim ok')
 
         # 3. check all system ready
         self.gazebo.unpauseSim()
@@ -360,39 +370,37 @@ class PX4Env(gym.Env):
 
         # 4. reset ekf2
         self.gazebo.unpauseSim()
-
         rospy.logdebug("reset ekf2 module")
-        ekf2_stop = subprocess.Popen([self.px4_ekf2_path, "stop"])
-        rospy.sleep(1)
-        ekf2_start = subprocess.Popen([self.px4_ekf2_path, "start"])
-        rospy.sleep(1)
-        # subprocess.Popen([self.px4_ekf2_path, "status"])
+        subprocess.Popen([self.px4_ekf2_path, "stop"])
+        subprocess.Popen([self.px4_ekf2_path, "start"])
+        subprocess.Popen([self.px4_ekf2_path, "status"])
+        rospy.logdebug('wait for ekf ok')
+        local_pose = rospy.wait_for_message('/mavros/local_position/pose', PoseStamped)
+        rospy.logdebug(local_pose)
+        while math.sqrt(local_pose.pose.position.x * local_pose.pose.position.x + local_pose.pose.position.y * local_pose.pose.position.y) > 1:
+            rospy.logdebug(local_pose.pose.position)
+            local_pose = rospy.wait_for_message('/mavros/local_position/pose', PoseStamped)
+            rospy.sleep(0.5)
+        
+        rospy.logdebug('ekf2 reset over')
+        
+        rospy.logdebug('wait for arm...')
+        self.Arm()
+        
+        rospy.logdebug('wait for takeoff...')
+        self.TakeOff()
+        
         self.gazebo.pauseSim()
         
         rospy.logdebug("RESET SIM END")
 
     def _init_env_variables(self):
         rospy.logdebug('_init_env_variables start')
-        # take off and change to offboard mode
-        self.gazebo.unpauseSim()
         
-        if self._current_state.connected:
-
-            if not self.home_init:
-                # first time to init home position
-                self.SetHomePose()
-
-            self.Arm()
-            
-            self.TakeOff()
-
-            self._change_goal_pose_random()
-            goal_pose = self._goal_pose.pose.position
-            rospy.logdebug("changed goal pose to {} {} {}".format(goal_pose.x, goal_pose.y, goal_pose.z))
-        else:
-            rospy.logerr("NOT CONNECTED!!!!!!")
-
-            self.gazebo.pauseSim()
+        # reset goal position 
+        self._change_goal_pose_random()
+        goal_pose = self._goal_pose.pose.position
+        rospy.loginfo("changed goal pose to {} {} {}".format(goal_pose.x, goal_pose.y, goal_pose.z))
         
         # For Info Purposes
         self.step_num = 0
@@ -1013,9 +1021,9 @@ class PX4Env(gym.Env):
 
         else:
             if self.is_in_desired_pose():
-                reward = 10
+                reward = 0
             if self.too_close_to_obstacle() or not self.is_inside_workspace():
-                reward = -10
+                reward = -0
 
         return reward
 
@@ -1077,7 +1085,8 @@ class PX4Env(gym.Env):
 
         while not self._current_state.armed:
             self._arming_client.call(True)
-            rospy.sleep(0.1)
+            rospy.logdebug('try to arm')
+            rospy.sleep(0.5)
 
         rospy.logdebug("ARMED!!!")
 
@@ -1089,6 +1098,22 @@ class PX4Env(gym.Env):
             self._arming_client.call(False)
             rospy.sleep(0.1)
 
+        rospy.logdebug("DISARMED!!!")
+
+    def DisarmForce(self):
+        rospy.logdebug("wait for disarmed force")
+        rospy.wait_for_service("/mavros/cmd/command")
+
+        ret = self._mavros_cmd_client.call(False,
+                                           400, 0,
+                                           0.0, 21196.0,
+                                           0.0, 0.0, 0.0, 0.0, 0.0)
+        while not ret.success:
+            ret = self._mavros_cmd_client.call(False,
+                                               400, 0,
+                                               0.0, 21196.0,
+                                               0.0, 0.0, 0.0, 0.0, 0.0)
+            rospy.sleep(0.1)
         rospy.logdebug("DISARMED!!!")
 
     def SetHomePose(self):
@@ -1103,7 +1128,7 @@ class PX4Env(gym.Env):
                                                     altitude=self._current_gps.altitude)
 
         while not ret_sethome.success:
-            # rospy.logwarn("Failed to set home, try again")
+            rospy.logwarn("Failed to set home, try again")
             ret_sethome = self._set_home_client(current_gps=True, latitude=self._current_gps.latitude, longitude=self._current_gps.longitude, \
                                                     altitude=self._current_gps.altitude)
         
@@ -1415,7 +1440,6 @@ class PX4Env(gym.Env):
             self.q_value_map[6, :, :] = np.nan
             self.q_value_map[7, :, :] = np.nan
             self.q_value_map[8, :, :] = np.nan
-
 
     def visual_CNN_heat_maps(self, obs_used):
         '''
