@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2022-11-03 22:59:45
+LastEditTime: 2022-11-15 21:20:52
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -55,11 +55,13 @@ class PX4Env(gym.Env):
 
         self._rate = rospy.Rate(10.0)
 
-        self.max_depth_meter_gazebo = 10
+        self.max_depth_meter_gazebo = 18
 
         self.model = None
         self.use_ppo = False  # check if use ppo or other algos, used only for visualization
         self.policy = None
+        self.obs_type = 'vector'  # vector or image
+        self.use_expert = False
 
         # Subscribers 
         rospy.Subscriber('mavros/state', State, callback=self._stateCb, queue_size=10)
@@ -128,9 +130,9 @@ class PX4Env(gym.Env):
         Settings for control method
         '''
         self.action_num = 2         # 2 for 2d, 3 for 3d
-        self.state_length = 2       # 2 for only position info, 4 for position and vel info
+        self.state_length = 4       # 2 for only position info, 4 for position and vel info
         self.control_method = 'vel' # acc or vel
-        self.takeoff_hight = 4
+        self.takeoff_hight = 5
         
         '''
         Settings for termination
@@ -152,10 +154,13 @@ class PX4Env(gym.Env):
         '''
         observation space
         '''
-        self.screen_height = 80
-        self.screen_width = 100
+        self.screen_height = 60
+        self.screen_width = 90
         
-        self.observation_space = spaces.Box(low=np.float32(0), high=np.float32(255), shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
+        if self.obs_type == 'vector':
+            self.observation_space = spaces.Box(low=np.float32(0), high=np.float32(1), shape=(25+self.state_length,))
+        else:
+            self.observation_space = spaces.Box(low=np.float32(0), high=np.float32(255), shape=(self.screen_height, self.screen_width, 2), dtype=np.uint8)
 
         self._state_raw = np.zeros(self.state_length)
         self._state_norm = np.zeros(self.state_length)
@@ -165,14 +170,10 @@ class PX4Env(gym.Env):
         action space
         '''
         # output forward vertital speed and yaw rate
-        self.vel_xy_max = 2
-        self.vel_xy_min = 0.5
+        self.vel_xy_max = 3
+        self.vel_xy_min = 0.1
         self.vel_z_max = 1
         self.vel_yaw_max = math.radians(30)
-
-        # self.acc_xy_max = 1
-        # self.acc_z_max = 0.5
-        # self.acc_yaw_max = math.radians(60)
 
         if self.action_num == 3:
             self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_z_max, -self.vel_yaw_max]), \
@@ -184,27 +185,11 @@ class PX4Env(gym.Env):
                                             dtype=np.float32)
         else:
             print("error: action num must be 2 or 3")
-
-        # if self.action_num == 3:
-        #     # 3d control
-        #     if self.control_method == 'vel':
-        #         self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_z_max, -self.vel_yaw_max]), \
-        #                                         high=np.array([self.vel_xy_max, self.vel_z_max, self.vel_yaw_max]), \
-        #                                         dtype=np.float32)
-        #     elif self.control_method == 'acc':
-        #         self.action_space = spaces.Box(low=np.array([-self.acc_xy_max, -self.acc_z_max, -self.acc_yaw_max]), \
-        #                                        high=np.array([self.acc_xy_max, self.acc_z_max, self.acc_yaw_max]), \
-        #                                            dtype=np.float32)
-        # elif self.action_num == 2:
-        #     # 2d control
-        #     if self.control_method == 'vel':
-        #         self.action_space = spaces.Box(low=np.array([self.vel_xy_min, -self.vel_yaw_max]), \
-        #                                         high=np.array([self.vel_xy_max, self.vel_yaw_max]), \
-        #                                         dtype=np.float32)
-        #     elif self.control_method == 'acc':
-        #         self.action_space = spaces.Box(low=np.array([-self.acc_xy_max, -self.acc_yaw_max]), \
-        #                                        high=np.array([self.acc_xy_max, self.acc_yaw_max]), \
-        #                                            dtype=np.float32)
+        
+        # for pretrain test
+        # self.action_space = spaces.Box(low=np.array([-self.vel_yaw_max]), \
+        #                                     high=np.array([self.vel_yaw_max]), \
+        #                                     dtype=np.float32)
 
         rospy.logdebug('mavdrone_test_env_helei node initialized...')
 
@@ -296,7 +281,7 @@ class PX4Env(gym.Env):
         self.step_num += 1
         self.total_step += 1
 
-        self.publish_train_info(self.last_obs, action, obs, done, reward, self.cumulated_episode_reward)
+        # self.publish_train_info(self.last_obs, action, obs, done, reward, self.cumulated_episode_reward)
         self.last_obs = obs
     
         return obs, reward, done, info
@@ -415,6 +400,14 @@ class PX4Env(gym.Env):
         self.cumulated_episode_reward = 0
 
     def _get_obs(self):
+        if self.obs_type == 'vector':
+            obs = self._get_obs_vector()
+        else:
+            obs = self._get_obs_image()
+        
+        return obs
+    
+    def _get_obs_image(self):
         # get depth image from current topic
         image = self._depth_image_gray.copy() # Note: check image format. Now is 0-black near 255-wight far
 
@@ -436,7 +429,38 @@ class PX4Env(gym.Env):
         image_with_state = image_with_state.swapaxes(0, 1)
         
         return image_with_state
-
+    
+    def _get_obs_vector(self):
+        # get normalized obs for no_cnn
+        image = self._depth_image_gray.copy() # Note: check image format. Now is 0-black near 255-wight far
+        image_obs = 255 - image
+        
+        # publish image_obs
+        image_obs_msg = self.bridge.cv2_to_imgmsg(image_obs)
+        self._depth_image_gray_input.publish(image_obs_msg)
+        
+        # 将图像进行分割，然后得到最大值转换成feature
+        split_row = 5
+        split_col = 5
+        
+        v_split_list = np.vsplit(image_obs, split_col)
+        
+        split_final = []
+        for i in range(split_col):
+            h_split_list = np.hsplit(v_split_list[i], split_row)
+            for j in range(split_row):
+                split_final.append(h_split_list[j].max())
+        
+        img_feature = np.array(split_final) / 255.0
+        
+        state_feature = self._get_state_feature() / 255
+        
+        feature_all = np.concatenate((img_feature, state_feature), axis=0)
+        # feature_all = state_feature[-1]
+        # print(feature_all)
+        
+        return feature_all
+            
     def _get_state_feature(self):
         '''
         get state feature with velocity!
@@ -494,70 +518,59 @@ class PX4Env(gym.Env):
 
         return state_norm
 
+    def get_expert_action(self):
+        # get PX4 avoidance action as expert demo
+        action = np.zeros(self.action_num)
+        current_pose = self._current_pose
+        desired_pose = self._pose_setpoint_avoidance
+        
+        x_err = desired_pose.pose.position.x - current_pose.pose.position.x
+        y_err = desired_pose.pose.position.y - current_pose.pose.position.y
+        z_err = desired_pose.pose.position.z - current_pose.pose.position.z
+        
+        forward_speed = math.sqrt(pow(x_err, 2) + pow(y_err, 2))
+        if forward_speed > self.vel_xy_max:
+            forward_speed = self.vel_xy_max
+        if forward_speed < self.vel_xy_min:
+            forward_speed = self.vel_xy_min
+            
+        explicit_quat1 = [desired_pose.pose.orientation.x, desired_pose.pose.orientation.y, desired_pose.pose.orientation.z, \
+                            desired_pose.pose.orientation.w]
+        explicit_quat2 = [current_pose.pose.orientation.x, current_pose.pose.orientation.y, \
+                            current_pose.pose.orientation.z, current_pose.pose.orientation.w]
+        
+        yaw_setpoint = euler_from_quaternion(explicit_quat1)[2]
+        yaw_current = euler_from_quaternion(explicit_quat2)[2]
+        yaw_err = self._get_yaw_error(yaw_setpoint, yaw_current)
+        
+        # using only P for velocity control
+        action[0] = forward_speed
+        if self.action_num == 3:
+            action[1] = z_err
+        action[-1] = yaw_err * 2.8
+        
+        action[-1] = np.clip(action[-1], -self.vel_yaw_max, self.vel_yaw_max)
+        
+        return action
+        
     def set_action_velocity(self, action):
         """
         Set linear and angular velocity according to action
         """
-
-        # print('action_ori: ', action)
-        use_avoidance_cmd = False
-
         velocity_cmd_body = PositionTarget()
+        velocity_cmd_body.type_mask = 1479
+        velocity_cmd_body.coordinate_frame = 8
         
-        if use_avoidance_cmd:
-            # get avoidance output
-            # transfer _pose_avoidance_setpoint to velocity
-            current_pose = self._current_pose
-            desired_pose = self._pose_setpoint_avoidance
+        current_pose = self._current_pose
 
-            linear_velocity = Vector3()
-            linear_velocity.x = desired_pose.pose.position.x - current_pose.pose.position.x
-            linear_velocity.y = desired_pose.pose.position.y - current_pose.pose.position.y
-            linear_velocity.z = desired_pose.pose.position.z - current_pose.pose.position.z
-
-            forward_speed = math.sqrt(pow(linear_velocity.x, 2) + pow(linear_velocity.y, 2))
-            if forward_speed > self.forward_speed_max:
-                forward_speed = self.forward_speed_max
-
-            angular_velocity = Vector3()
-            angular_velocity.x = 0
-            angular_velocity.y = 0
-            explicit_quat1 = [desired_pose.pose.orientation.x, desired_pose.pose.orientation.y, desired_pose.pose.orientation.z, \
-                                desired_pose.pose.orientation.w]
-            explicit_quat2 = [current_pose.pose.orientation.x, current_pose.pose.orientation.y, \
-                                current_pose.pose.orientation.z, current_pose.pose.orientation.w]
-            yaw_setpoint = euler_from_quaternion(explicit_quat1)[2]
-            yaw_current = euler_from_quaternion(explicit_quat2)[2]
-            angular_velocity.z = self.getAngularVelocity(yaw_setpoint, yaw_current)
-
-            velocity_cmd_body.type_mask = 1475
-            velocity_cmd_body.coordinate_frame = 8
-            velocity_cmd_body.position.z = 3
-            velocity_cmd_body.velocity.x = 0
-            velocity_cmd_body.velocity.y = forward_speed
-            velocity_cmd_body.velocity.z = 0
-            velocity_cmd_body.yaw_rate = angular_velocity.z
-
+        velocity_cmd_body.velocity.x = action[0]
+        velocity_cmd_body.velocity.y = 0
+        if self.action_num == 2:
+            z_error = self.takeoff_hight - current_pose.pose.position.z
+            velocity_cmd_body.velocity.z = z_error
         else:
-            if self.action_num == 2:
-                # for 2D navigation
-                velocity_cmd_body.type_mask = 1475
-                velocity_cmd_body.coordinate_frame = 8
-                velocity_cmd_body.position.z = self.takeoff_hight
-                velocity_cmd_body.velocity.x = action[0]
-                velocity_cmd_body.velocity.y = 0
-                velocity_cmd_body.velocity.z = 0
-                velocity_cmd_body.yaw_rate = action[-1]
-            elif self.action_num == 3:
-                # for 3D navigation
-                velocity_cmd_body.type_mask = 1479
-                velocity_cmd_body.coordinate_frame = 8
-                velocity_cmd_body.velocity.x = action[0]
-                velocity_cmd_body.velocity.y = 0
-                velocity_cmd_body.velocity.z = action[1]
-                velocity_cmd_body.yaw_rate = action[-1]
-            else:
-                print('action num error')
+            velocity_cmd_body.velocity.z = action[1]
+        velocity_cmd_body.yaw_rate = action[-1]
         
         self._action_velocity_body_pub.publish(velocity_cmd_body)
         self.publish_marker_velocity_pose(action)
@@ -786,7 +799,7 @@ class PX4Env(gym.Env):
 
         # transfer dx dy from local frame to body frame
         dx_body, dy_body = self.point_transfer(dx_local, dy_local, yaw_current)
-        yaw_speed = self.getAngularVelocity(yaw_setpoint, yaw_current)
+        yaw_speed = self._get_yaw_error(yaw_setpoint, yaw_current)
 
         # print(dx_local, dy_local, math.degrees(yaw_current), dx_body, dy_body, math.degrees(yaw_setpoint))
 
@@ -823,7 +836,7 @@ class PX4Env(gym.Env):
         yaw_setpoint = euler_from_quaternion(explicit_quat1)[2]
         yaw_current = euler_from_quaternion(explicit_quat2)[2]
 
-        yaw_different = self.getAngularVelocity(yaw_setpoint, yaw_current)
+        yaw_different = self._get_yaw_error(yaw_setpoint, yaw_current)
 
         print("yaw_sp: {:.2f} yaw: {:.2f} yaw_diff: {:.2f}".format(math.degrees(yaw_setpoint), math.degrees(yaw_current), math.degrees(yaw_different)))
         
@@ -1010,7 +1023,23 @@ class PX4Env(gym.Env):
             # Obstacle punishment
             punishment_obs = 1 - np.clip((self._depth_image_meter.min() - self.min_dist_to_obs_meters) / 5, 0, 1)
             # print(punishment_obs)
-            reward = reward_dist - 0.05 * punishment_action - 0.01 * punishment_pose - 0.01 * punishment_obs*punishment_obs
+            
+            # action acc punishment
+            punishment_action_acc = 0
+            if self.state_length == 4:
+                # 如果是2D 包含速度信息，可以使用action_acc punishment
+                current_velocity_xy = self.state_feature_raw[2]
+                current_yaw_rate = self.state_feature_raw[3]
+                acc_xy = abs(action[0] - current_velocity_xy) / self.vel_xy_max / 2
+                acc_yaw = abs(action[1] - current_yaw_rate) / self.vel_yaw_max / 2
+                punishment_action_acc = acc_xy  + acc_yaw 
+                
+                # print(acc_xy, acc_yaw, punishment_action_acc)
+             
+            # 原始 reward
+            # reward = reward_dist - 0.05 * punishment_action - 0.01 * punishment_pose - 0.01 * punishment_obs*punishment_obs
+            # 新 reward 增加对于action突变引起的 punishment 让控制更顺滑
+            reward = reward_dist - 0.1 * punishment_action - 0.1 * punishment_action_acc - 0.1 * punishment_pose - 0.1 * punishment_obs * punishment_obs
             # reward = reward * 10
             # reward = reward_dist - punishment_pose - punishment_action
             # reward = reward_dist - 0.01
@@ -1021,9 +1050,9 @@ class PX4Env(gym.Env):
 
         else:
             if self.is_in_desired_pose():
-                reward = 0
+                reward = 10
             if self.too_close_to_obstacle() or not self.is_inside_workspace():
-                reward = -0
+                reward = -10
 
         return reward
 
@@ -1241,7 +1270,7 @@ class PX4Env(gym.Env):
 
         return in_desired_pose
 
-    def getAngularVelocity(self, desired_yaw, curr_yaw):
+    def _get_yaw_error(self, desired_yaw, curr_yaw):
         angular_error = desired_yaw - curr_yaw
         if angular_error > math.pi:
             angular_error -= math.pi * 2
