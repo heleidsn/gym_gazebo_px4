@@ -1,7 +1,7 @@
 '''
 Author: Lei He
 Date: 2021-04-15 10:17:06
-LastEditTime: 2022-11-30 14:08:49
+LastEditTime: 2022-12-13 10:56:25
 Description: 
 Github: https://github.com/heleidsn
 '''
@@ -130,7 +130,7 @@ class PX4Env(gym.Env):
         Settings for control method
         '''
         self.action_num = 2         # 2 for 2d, 3 for 3d
-        self.state_length = 2       # 2 for only position info, 4 for position and vel info
+        self.state_length = 4       # 2 for only position info, 4 for position and vel info
         self.control_method = 'vel' # acc or vel
         self.takeoff_hight = 5
         
@@ -149,7 +149,7 @@ class PX4Env(gym.Env):
         self.work_space_z_min = 1
         self.max_vertical_difference = 5
 
-        self.min_dist_to_obs_meters = 3  # min distance to obstacle
+        self.min_dist_to_obs_meters = 1  # min distance to obstacle
 
         '''
         observation space
@@ -1311,6 +1311,9 @@ class PX4Env(gym.Env):
 
         return yaw_error
 
+    def get_current_pose(self):
+        return np.array([self._current_pose.pose.position.x, self._current_pose.pose.position.y, self._current_pose.pose.position.z])
+    
     def _change_goal_pose_random(self):
         distance = self.goal_distance
 
